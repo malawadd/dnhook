@@ -17,6 +17,9 @@ export type LiveConfigView = {
 export type TraderView = {
   id: number;
   address: string;
+  setupStatus: 'setup' | 'ready' | 'blocked' | 'trading';
+  latestNonce: number;
+  pendingNonce: number;
   nativeBalanceEth: string;
   token0Balance: string;
   token1Balance: string;
@@ -62,6 +65,7 @@ export type LiveSnapshot = {
 
 export type LiveEventKind =
   | 'info'
+  | 'warning'
   | 'error'
   | 'wallet'
   | 'funding'

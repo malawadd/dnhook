@@ -214,9 +214,26 @@ code {
   padding: 4px 8px;
 }
 
-.pill.ok {
+.pill.ready,
+.pill.trading {
   background: #e6f6ee;
   color: #006b41;
+}
+
+.pill.blocked {
+  background: #fff0f0;
+  color: #a00000;
+}
+
+.pill.setup {
+  background: #fff7e6;
+  color: #7a4b00;
+}
+
+.traderError {
+  color: #a00000;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .eventTape {
@@ -243,6 +260,10 @@ code {
 
 .event.error {
   border-color: #d00000;
+}
+
+.event.warning {
+  border-color: #f48c06;
 }
 
 .event.swap {

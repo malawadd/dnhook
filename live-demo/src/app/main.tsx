@@ -109,6 +109,8 @@ function App() {
           Arm live transaction controls
         </label>
         <button disabled={Boolean(busy)} onClick={() => action('Prepare wallets', '/api/demo/prepare')}>Prepare wallets</button>
+        <button disabled={Boolean(busy)} onClick={() => action('Refresh nonces', '/api/demo/refresh-nonces')}>Refresh nonces</button>
+        <button disabled={Boolean(busy) || !armed} onClick={() => action('Rotate wallets', '/api/demo/rotate-wallets')}>Rotate wallets</button>
         <button disabled={Boolean(busy) || !armed} onClick={() => action('Fund traders', '/api/demo/fund')}>Fund traders</button>
         <button disabled={Boolean(busy) || !armed} onClick={() => action('Start trading', '/api/demo/start-trading')}>Start trading</button>
         <button disabled={Boolean(busy)} onClick={() => action('Pause trading', '/api/demo/stop-trading')}>Pause trading</button>
@@ -165,11 +167,13 @@ function App() {
               <div className="trader" key={trader.address}>
                 <div className="traderTop">
                   <strong>#{trader.id}</strong>
-                  <span className={trader.ready ? 'pill ok' : 'pill'}>{trader.ready ? 'ready' : 'setup'}</span>
+                  <span className={`pill ${trader.setupStatus}`}>{trader.setupStatus}</span>
                 </div>
                 <code>{trader.address.slice(0, 8)}...{trader.address.slice(-6)}</code>
                 <p>{Number(trader.nativeBalanceEth).toFixed(4)} ETH</p>
+                <p>nonce {trader.latestNonce}/{trader.pendingNonce}</p>
                 <p>{trader.swapsConfirmed}/{trader.swapsSubmitted} swaps</p>
+                {trader.lastError ? <p className="traderError">{trader.lastError}</p> : null}
               </div>
             ))}
           </div>

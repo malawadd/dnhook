@@ -111,6 +111,46 @@ const productionPoolConfigComponents = [
 ] as const;
 
 export const productionHookAbi = [
+  { type: 'error', name: 'NotOwner', inputs: [] },
+  { type: 'error', name: 'NotManager', inputs: [] },
+  { type: 'error', name: 'NotKeeper', inputs: [] },
+  { type: 'error', name: 'NotPoolManager', inputs: [] },
+  { type: 'error', name: 'NotLiquidityManager', inputs: [] },
+  { type: 'error', name: 'MustUseDynamicFee', inputs: [] },
+  { type: 'error', name: 'PoolNotConfigured', inputs: [] },
+  { type: 'error', name: 'InvalidFeeConfig', inputs: [] },
+  { type: 'error', name: 'InvalidRiskConfig', inputs: [] },
+  { type: 'error', name: 'InvalidAddress', inputs: [] },
+  { type: 'error', name: 'PoolIsPaused', inputs: [] },
+  { type: 'error', name: 'PendingOrderExists', inputs: [{ name: 'orderId', type: 'bytes32' }] },
+  { type: 'error', name: 'NoPendingOrder', inputs: [] },
+  { type: 'error', name: 'NoRebalanceNeeded', inputs: [] },
+  {
+    type: 'error',
+    name: 'InsufficientCollateral',
+    inputs: [
+      { name: 'collateralUsd', type: 'uint256' },
+      { name: 'requiredUsd', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'MaxLossExceeded',
+    inputs: [
+      { name: 'pnlUsd', type: 'int256' },
+      { name: 'maxLossUsd', type: 'uint256' },
+    ],
+  },
+  { type: 'error', name: 'HedgeAdapterUnhealthy', inputs: [] },
+  {
+    type: 'error',
+    name: 'OrderIdMismatch',
+    inputs: [
+      { name: 'expected', type: 'bytes32' },
+      { name: 'actual', type: 'bytes32' },
+    ],
+  },
+  { type: 'error', name: 'Reentrancy', inputs: [] },
   {
     type: 'function',
     name: 'keepers',

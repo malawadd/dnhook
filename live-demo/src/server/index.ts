@@ -25,6 +25,14 @@ app.post('/api/demo/prepare', async (_request, response) => {
   await route(response, () => orchestrator.prepareWallets());
 });
 
+app.post('/api/demo/refresh-nonces', async (_request, response) => {
+  await route(response, () => orchestrator.refreshAllNonces());
+});
+
+app.post('/api/demo/rotate-wallets', async (request, response) => {
+  await armedRoute(request, response, () => orchestrator.rotateWallets());
+});
+
 app.post('/api/demo/fund', async (_request, response) => {
   await armedRoute(_request, response, () => orchestrator.fundWallets());
 });

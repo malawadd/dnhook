@@ -45,6 +45,8 @@ export type PoolKey = {
 export type LiveDemoConfig = {
   apiPort: number;
   rpcUrl: string;
+  rpcUrls: string[];
+  writeRpcUrl: string;
   privateKey: Hex;
   traderCount: number;
   traderFundingWei: bigint;
@@ -59,14 +61,22 @@ export type LiveDemoConfig = {
   deploymentPath: string;
   stateDir: string;
   minTxIntervalMs: number;
+  getLogsBlockSpan: number;
+  priceBackfillBlocks: number;
+  replacementFeeBumpBps: bigint;
+  nonceConfirmTimeoutMs: number;
+  allowWalletRotation: boolean;
 };
 
 export function loadLiveConfig(): LiveDemoConfig {
   const traderFundingEth = process.env.LIVE_TRADER_FUNDING_ETH?.trim() || '0.05';
   const maxTxPerMinute = parsePositiveInt(process.env.LIVE_MAX_TX_PER_MIN, 30);
+  const rpcUrls = parseRpcUrls();
   return {
     apiPort: parsePositiveInt(process.env.LIVE_DEMO_API_PORT, 8787),
-    rpcUrl: process.env.BASE_SEPOLIA_RPC_URL?.trim() || 'https://sepolia.base.org',
+    rpcUrl: process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0],
+    rpcUrls,
+    writeRpcUrl: process.env.BASE_SEPOLIA_WRITE_RPC_URL?.trim() || process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0],
     privateKey: normalizePrivateKey(required(process.env.PRIVATE_KEY, 'PRIVATE_KEY')),
     traderCount: clampTraderCount(parsePositiveInt(process.env.LIVE_TRADER_COUNT, 10)),
     traderFundingWei: parseFundingTarget(traderFundingEth),
@@ -81,6 +91,11 @@ export function loadLiveConfig(): LiveDemoConfig {
     deploymentPath: process.env.LIVE_DEPLOYMENT_PATH || defaultDeploymentPath,
     stateDir: resolve(liveDemoRoot, '.demo-state'),
     minTxIntervalMs: txIntervalFromRateLimit(maxTxPerMinute),
+    getLogsBlockSpan: parsePositiveInt(process.env.LIVE_GET_LOGS_BLOCK_SPAN, 10),
+    priceBackfillBlocks: parsePositiveInt(process.env.LIVE_PRICE_BACKFILL_BLOCKS, 40),
+    replacementFeeBumpBps: BigInt(parsePositiveInt(process.env.LIVE_REPLACEMENT_FEE_BUMP_BPS, 2500)),
+    nonceConfirmTimeoutMs: parsePositiveInt(process.env.LIVE_NONCE_CONFIRM_TIMEOUT_MS, 120_000),
+    allowWalletRotation: parseBoolean(process.env.LIVE_ALLOW_WALLET_ROTATION),
   };
 }
 
@@ -156,4 +171,19 @@ function parsePositiveInt(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error('Expected a positive integer environment value.');
   return parsed;
+}
+
+function parseRpcUrls() {
+  const defaults = ['https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'];
+  const configured = process.env.BASE_SEPOLIA_RPC_URLS?.split(',').map((url) => url.trim()).filter(Boolean) ?? [];
+  const primary = process.env.BASE_SEPOLIA_RPC_URL?.trim();
+  return uniqueStrings([...(primary ? [primary] : []), ...configured, ...defaults]);
+}
+
+function uniqueStrings(values: string[]) {
+  return [...new Set(values)];
+}
+
+function parseBoolean(value: string | undefined) {
+  return value === '1' || value?.toLowerCase() === 'true';
 }

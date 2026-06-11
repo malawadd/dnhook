@@ -47,12 +47,20 @@ export type ProductionRiskState = {
 
 export type ProductionPoolConfig = {
   hedgeThresholdBase: bigint;
+  maxSnapshotAge: bigint;
 };
 
 export type ProductionKeeperDecision =
   | {
       kind: 'skip';
-      reason: 'not-keeper' | 'pending-not-ready' | 'inside-threshold' | 'missing-price';
+      reason:
+        | 'not-keeper'
+        | 'pending-not-ready'
+        | 'inside-threshold'
+        | 'missing-price'
+        | 'adapter-unhealthy'
+        | 'stale-snapshot'
+        | 'defensive';
       message: string;
     }
   | {
@@ -159,6 +167,30 @@ export function decideProductionAction(input: {
     };
   }
 
+  if (!input.state.adapterHealthy) {
+    return {
+      kind: 'skip',
+      reason: 'adapter-unhealthy',
+      message: 'Production adapter is unhealthy. Keeper will not commit a new hedge.',
+    };
+  }
+
+  if (isSnapshotStale(input.state, input.config, input.now)) {
+    return {
+      kind: 'skip',
+      reason: 'stale-snapshot',
+      message: 'Production hedge snapshot is stale. Refresh the adapter snapshot before rebalancing.',
+    };
+  }
+
+  if (input.state.healthMode === 3) {
+    return {
+      kind: 'skip',
+      reason: 'defensive',
+      message: 'Production pool is defensive. Keeper will not commit a new hedge until health recovers.',
+    };
+  }
+
   const netDelta = input.state.netBaseDelta;
   if (absBigInt(netDelta) < input.config.hedgeThresholdBase) {
     return {
@@ -221,6 +253,7 @@ export function normalizeProductionPoolConfig(data: unknown): ProductionPoolConf
   const value = data as Partial<ProductionPoolConfig> & Record<number, unknown>;
   return {
     hedgeThresholdBase: coerceBigInt(value.hedgeThresholdBase ?? value[7]),
+    maxSnapshotAge: coerceBigInt(value.maxSnapshotAge ?? value[10]),
   };
 }
 
@@ -252,6 +285,17 @@ function coerceBigInt(value: unknown) {
 
 function absBigInt(value: bigint) {
   return value < 0n ? -value : value;
+}
+
+export function snapshotAgeSeconds(state: ProductionRiskState, now: bigint) {
+  if (state.lastSnapshotTimestamp === 0n) return now;
+  return now > state.lastSnapshotTimestamp ? now - state.lastSnapshotTimestamp : 0n;
+}
+
+export function isSnapshotStale(state: ProductionRiskState, config: ProductionPoolConfig, now: bigint) {
+  if (config.maxSnapshotAge === 0n) return false;
+  if (state.lastSnapshotTimestamp === 0n) return true;
+  return now > state.lastSnapshotTimestamp + config.maxSnapshotAge;
 }
 
 const zeroHash = `0x${'0'.repeat(64)}` as const;

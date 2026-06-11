@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "once": "tsx src/index.ts --once",
+    "production:recover-snapshot": "tsx src/recoverProductionSnapshot.ts",
     "demo:production:happy": "tsx src/demo.ts happy",
     "demo:production:defensive": "tsx src/demo.ts defensive",
     "demo:production:full": "tsx src/demo.ts full",

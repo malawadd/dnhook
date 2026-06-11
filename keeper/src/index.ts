@@ -11,6 +11,7 @@ import {
   normalizeProductionPoolConfig,
   normalizeProductionRiskState,
   normalizeRiskState,
+  snapshotAgeSeconds,
   type ProductionRiskState,
   type RiskState,
 } from './risk.js';
@@ -156,7 +157,7 @@ async function runProductionKeeperOnce(input: {
     readProductionSnapshot(input.clients, input.hook, input.poolKey),
     input.clients.publicClient.getBlock(),
   ]);
-  logProductionSnapshot(state);
+  logProductionSnapshot(state, block.timestamp, config.maxSnapshotAge);
 
   const decision = decideProductionAction({
     keeperAllowed,
@@ -272,7 +273,7 @@ function logSnapshot(label: string, state: RiskState, netDelta: bigint) {
   );
 }
 
-function logProductionSnapshot(state: ProductionRiskState) {
+function logProductionSnapshot(state: ProductionRiskState, blockTimestamp?: bigint, maxSnapshotAge?: bigint) {
   console.log(
     `[production] ${formatDeltaEquation(
       {
@@ -287,8 +288,13 @@ function logProductionSnapshot(state: ProductionRiskState) {
       state.netBaseDelta,
     )}`,
   );
+  const age = blockTimestamp === undefined ? 'unknown' : snapshotAgeSeconds(state, blockTimestamp).toString();
+  const maxAge = maxSnapshotAge === undefined ? 'unknown' : maxSnapshotAge.toString();
   console.log(
     `[production] pendingOrder=${state.pendingOrderId} pendingBase=${state.pendingOrderBase.toString()} mark=${state.lastMarkPrice.toString()} health=${state.healthMode}`,
+  );
+  console.log(
+    `[production] adapterHealthy=${state.adapterHealthy} snapshotAge=${age}s maxSnapshotAge=${maxAge}s collateralUsd=${state.collateralUsd.toString()} lastMarkPrice=${state.lastMarkPrice.toString()}`,
   );
 }
 

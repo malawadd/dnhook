@@ -1,19 +1,19 @@
 import {
   formatEther,
   formatUnits,
-  getContractError,
   maxUint256,
   parseUnits,
   type Address,
   type Hex,
-  type PublicClient,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { demoErc20Abi, demoHedgeAdapterAbi, poolManagerSwapEvent, poolSwapTestAbi, productionHookAbi } from './abi.js';
 import { configView, poolKeyFromDeployment, type Deployment, type LiveDemoConfig, type PoolKey } from './config.js';
-import { makePublicClient, makeWalletClient } from './clients.js';
-import { loadOrCreateTraders, readTraders, type StoredTrader } from './walletStore.js';
+import { makePublicClient, makeWalletClient, makeWritePublicClient } from './clients.js';
+import { loadOrCreateTraders, readTraders, rotateTraders, type StoredTrader } from './walletStore.js';
 import { EventBus } from './eventBus.js';
+import { collectLogsInChunks, initialBackfillFromBlock, nextBlockAfterFailedRange } from './logRanges.js';
+import { PendingNonceGapError, TxCoordinator } from './txCoordinator.js';
 import {
   bigintToDecimal,
   boundedRandomAmount,
@@ -34,6 +34,9 @@ type RuntimeTrader = StoredTrader & {
   swapsFailed: number;
   ready: boolean;
   busy: boolean;
+  setupStatus: 'setup' | 'ready' | 'blocked' | 'trading';
+  latestNonce: number;
+  pendingNonce: number;
   lastTx?: Hex;
   lastError?: string;
 };
@@ -72,12 +75,15 @@ type LatestPoolPrice = {
 
 export class LiveDemoOrchestrator {
   readonly publicClient;
+  readonly writePublicClient;
   readonly deployer;
+  readonly txCoordinator;
   readonly poolKey;
   #traders: RuntimeTrader[] = [];
   #tradingTimers: NodeJS.Timeout[] = [];
   #keeperTimer?: NodeJS.Timeout;
   #snapshotTimer?: NodeJS.Timeout;
+  #setupPromise?: Promise<void>;
   #startedAt?: number;
   #lastTxAt = 0;
   #txSubmitted = 0;
@@ -90,8 +96,14 @@ export class LiveDemoOrchestrator {
     readonly deployment: Deployment,
     readonly events: EventBus,
   ) {
-    this.publicClient = makePublicClient(config.rpcUrl);
-    this.deployer = makeWalletClient(config.privateKey, config.rpcUrl);
+    this.publicClient = makePublicClient(config.rpcUrls);
+    this.writePublicClient = makeWritePublicClient(config.writeRpcUrl);
+    this.deployer = makeWalletClient(config.privateKey, config.writeRpcUrl);
+    this.txCoordinator = new TxCoordinator(this.writePublicClient, {
+      replacementFeeBumpBps: config.replacementFeeBumpBps,
+      nonceConfirmTimeoutMs: config.nonceConfirmTimeoutMs,
+      onEvent: (kind, message, extra) => this.events.emit(kind, message, extra),
+    });
     this.poolKey = poolKeyFromDeployment(deployment);
   }
 
@@ -99,6 +111,21 @@ export class LiveDemoOrchestrator {
     this.#traders = loadOrCreateTraders(this.config).map((trader) => this.#runtimeTrader(trader));
     this.events.emit('wallet', `Prepared ${this.#traders.length} trader wallets.`);
     await this.refreshSnapshot();
+    return this.snapshot();
+  }
+
+  async rotateWallets() {
+    this.stopTrading();
+    this.#traders = rotateTraders(this.config).map((trader) => this.#runtimeTrader(trader));
+    this.events.emit('wallet', `Rotated trader fleet and archived the previous state file.`);
+    await this.refreshAllNonces();
+    return this.snapshot();
+  }
+
+  async refreshAllNonces() {
+    this.ensureTradersLoaded();
+    await Promise.all(this.#traders.map((trader) => this.refreshTraderNonce(trader)));
+    this.events.emit('wallet', 'Refreshed trader nonces.');
     return this.snapshot();
   }
 
@@ -124,16 +151,19 @@ export class LiveDemoOrchestrator {
     for (const item of needs) {
       const topUp = positive(this.config.traderFundingWei - item.balance);
       if (topUp === 0n) continue;
-      const hash = await this.deployer.walletClient.sendTransaction({
-        to: item.trader.address,
-        value: topUp,
-      });
-      this.noteSubmitted();
+      const hash = await this.txCoordinator.send(this.deployer.account.address, `fund trader ${item.trader.id}`, (attempt) =>
+        this.deployer.walletClient.sendTransaction({
+          to: item.trader.address,
+          value: topUp,
+          nonce: attempt.nonce,
+          ...feeFields(attempt),
+        }),
+      );
+      this.noteConfirmedTx();
       this.events.emit('funding', `Funding trader ${item.trader.id} with ${formatEther(topUp)} ETH.`, {
         txHash: hash,
         trader: item.trader.address,
       });
-      await this.waitForSuccess(hash, `fund trader ${item.trader.id}`);
     }
 
     await this.refreshSnapshot();
@@ -144,16 +174,22 @@ export class LiveDemoOrchestrator {
     this.ensureTradersLoaded();
     if (this.#tradingTimers.length > 0) return this.snapshot();
     this.#startedAt = Date.now();
-    await this.ensureAllTraderTokensReady();
+    if (!this.#setupPromise) {
+      this.#setupPromise = this.ensureAllTraderTokensReady().finally(() => {
+        this.#setupPromise = undefined;
+      });
+    }
+    await this.#setupPromise;
 
     const cadence = Math.max(this.config.swapIntervalMs * this.#traders.length, this.config.minTxIntervalMs * this.#traders.length);
-    this.#traders.forEach((trader, index) => {
+    const activeTraders = this.#traders.filter((trader) => trader.setupStatus === 'ready');
+    activeTraders.forEach((trader, index) => {
       const firstDelay = Math.floor((cadence / this.#traders.length) * index);
       const timer = setTimeout(() => this.traderLoop(trader, cadence), firstDelay);
       this.#tradingTimers.push(timer);
     });
 
-    this.events.emit('info', `Started ${this.#traders.length} trader loops at ~${Math.round(cadence / this.#traders.length)}ms aggregate cadence.`);
+    this.events.emit('info', `Started ${activeTraders.length}/${this.#traders.length} trader loops at ~${Math.round(cadence / Math.max(1, activeTraders.length))}ms aggregate cadence.`);
     return this.snapshot();
   }
 
@@ -189,31 +225,37 @@ export class LiveDemoOrchestrator {
   }
 
   async triggerDefensiveScenario() {
-    const hash = await this.deployer.walletClient.writeContract({
-      address: this.deployment.hedgeAdapter,
-      abi: demoHedgeAdapterAbi,
-      functionName: 'setHealthy',
-      args: [this.deployment.poolId, false],
-      gas: 300_000n,
-    });
-    this.noteSubmitted();
+    const hash = await this.txCoordinator.send(this.deployer.account.address, 'adapter.setHealthy(false)', (attempt) =>
+      this.deployer.walletClient.writeContract({
+        address: this.deployment.hedgeAdapter,
+        abi: demoHedgeAdapterAbi,
+        functionName: 'setHealthy',
+        args: [this.deployment.poolId, false],
+        gas: 300_000n,
+        nonce: attempt.nonce,
+        ...feeFields(attempt),
+      }),
+    );
+    this.noteConfirmedTx();
     this.events.emit('scenario', 'Adapter set unhealthy. The hook should move defensive after sync.', { txHash: hash });
-    await this.waitForSuccess(hash, 'adapter.setHealthy(false)');
     await this.syncSnapshot();
     return this.snapshot();
   }
 
   async recoverScenario() {
-    const hash = await this.deployer.walletClient.writeContract({
-      address: this.deployment.hedgeAdapter,
-      abi: demoHedgeAdapterAbi,
-      functionName: 'resetDemoSnapshot',
-      args: [this.deployment.poolId, parseUnits('2000', 18), parseUnits('100000', 18)],
-      gas: 300_000n,
-    });
-    this.noteSubmitted();
+    const hash = await this.txCoordinator.send(this.deployer.account.address, 'adapter.resetDemoSnapshot', (attempt) =>
+      this.deployer.walletClient.writeContract({
+        address: this.deployment.hedgeAdapter,
+        abi: demoHedgeAdapterAbi,
+        functionName: 'resetDemoSnapshot',
+        args: [this.deployment.poolId, parseUnits('2000', 18), parseUnits('100000', 18)],
+        gas: 300_000n,
+        nonce: attempt.nonce,
+        ...feeFields(attempt),
+      }),
+    );
+    this.noteConfirmedTx();
     this.events.emit('scenario', 'Adapter snapshot recovered to healthy collateral and mark price.', { txHash: hash });
-    await this.waitForSuccess(hash, 'adapter.resetDemoSnapshot');
     await this.syncSnapshot();
     return this.snapshot();
   }
@@ -301,16 +343,19 @@ export class LiveDemoOrchestrator {
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (risk.pendingOrderId !== ZERO_HASH || risk.pendingOrderBase !== 0n) {
       if (risk.pendingOrderReadyAt !== 0n && now >= risk.pendingOrderReadyAt) {
-        const hash = await this.deployer.walletClient.writeContract({
-          address: this.deployment.hook,
-          abi: productionHookAbi,
-          functionName: 'settleHedgeOrder',
-          args: [this.poolKey],
-          gas: 1_000_000n,
-        });
-        this.noteSubmitted();
+        const hash = await this.txCoordinator.send(this.deployer.account.address, 'hook.settleHedgeOrder', (attempt) =>
+          this.deployer.walletClient.writeContract({
+            address: this.deployment.hook,
+            abi: productionHookAbi,
+            functionName: 'settleHedgeOrder',
+            args: [this.poolKey],
+            gas: 1_000_000n,
+            nonce: attempt.nonce,
+            ...feeFields(attempt),
+          }),
+        );
+        this.noteConfirmedTx();
         this.events.emit('keeper', `Settling hedge order ${risk.pendingOrderId.slice(0, 10)}...`, { txHash: hash });
-        await this.waitForSuccess(hash, 'settle hedge order');
       } else {
         this.events.emit('keeper', 'Pending hedge order is not ready yet.');
       }
@@ -328,16 +373,19 @@ export class LiveDemoOrchestrator {
 
     const hedgeDelta = -risk.netBaseDelta;
     const acceptablePrice = computeAcceptablePrice(risk.lastMarkPrice, hedgeDelta, this.config.maxHedgeSlippageBps);
-    const hash = await this.deployer.walletClient.writeContract({
-      address: this.deployment.hook,
-      abi: productionHookAbi,
-      functionName: 'rebalance',
-      args: [this.poolKey, acceptablePrice],
-      gas: 1_000_000n,
-    });
-    this.noteSubmitted();
+    const hash = await this.txCoordinator.send(this.deployer.account.address, 'hook.rebalance', (attempt) =>
+      this.deployer.walletClient.writeContract({
+        address: this.deployment.hook,
+        abi: productionHookAbi,
+        functionName: 'rebalance',
+        args: [this.poolKey, acceptablePrice],
+        gas: 1_000_000n,
+        nonce: attempt.nonce,
+        ...feeFields(attempt),
+      }),
+    );
+    this.noteConfirmedTx();
     this.events.emit('keeper', `Committed hedge for ${bigintToDecimal(hedgeDelta)} base.`, { txHash: hash });
-    await this.waitForSuccess(hash, 'rebalance');
   }
 
   private async traderLoop(trader: RuntimeTrader, cadence: number) {
@@ -366,53 +414,70 @@ export class LiveDemoOrchestrator {
     await this.waitForRateSlot();
     trader.busy = true;
     try {
-      const { walletClient } = makeWalletClient(trader.privateKey, this.config.rpcUrl);
+      trader.setupStatus = 'trading';
+      const { walletClient } = makeWalletClient(trader.privateKey, this.config.writeRpcUrl);
       const zeroForOne = Math.random() > 0.5;
       const amount = boundedRandomAmount(this.config.minSwapAmount, this.config.maxSwapAmount);
-      const hash = await walletClient.writeContract({
-        address: this.deployment.poolSwapTest,
-        abi: poolSwapTestAbi,
-        functionName: 'swap',
-        args: [
-          this.poolKey,
-          {
-            zeroForOne,
-            amountSpecified: -amount,
-            sqrtPriceLimitX96: zeroForOne ? MIN_SQRT_PRICE_LIMIT : MAX_SQRT_PRICE_LIMIT,
-          },
-          { takeClaims: false, settleUsingBurn: false },
-          '0x',
-        ],
-        gas: 1_000_000n,
-      });
+      const hash = await this.txCoordinator.send(trader.address, `trader ${trader.id} swap`, (attempt) =>
+        walletClient.writeContract({
+          address: this.deployment.poolSwapTest,
+          abi: poolSwapTestAbi,
+          functionName: 'swap',
+          args: [
+            this.poolKey,
+            {
+              zeroForOne,
+              amountSpecified: -amount,
+              sqrtPriceLimitX96: zeroForOne ? MIN_SQRT_PRICE_LIMIT : MAX_SQRT_PRICE_LIMIT,
+            },
+            { takeClaims: false, settleUsingBurn: false },
+            '0x',
+          ],
+          gas: 1_000_000n,
+          nonce: attempt.nonce,
+          ...feeFields(attempt),
+        }),
+      );
 
       trader.swapsSubmitted++;
       trader.lastTx = hash;
-      this.noteSubmitted();
+      this.noteConfirmedTx();
       this.events.emit('swap', `Trader ${trader.id} submitted ${zeroForOne ? 'USDC -> WETH' : 'WETH -> USDC'} swap.`, {
         txHash: hash,
         trader: trader.address,
       });
-      await this.waitForSuccess(hash, `trader ${trader.id} swap`);
       trader.swapsConfirmed++;
       trader.lastError = undefined;
       this.events.emit('swap', `Trader ${trader.id} swap confirmed.`, { txHash: hash, trader: trader.address });
     } finally {
       trader.busy = false;
+      if (trader.setupStatus === 'trading') trader.setupStatus = 'ready';
     }
   }
 
   private async ensureAllTraderTokensReady() {
     for (const trader of this.#traders) {
-      await this.ensureTokenReady(trader, this.deployment.currency0);
-      await this.ensureTokenReady(trader, this.deployment.currency1);
-      trader.ready = true;
-      this.events.emit('token', `Trader ${trader.id} has faucet balances and swap approvals.`, { trader: trader.address });
+      trader.setupStatus = 'setup';
+      try {
+        await this.refreshTraderNonce(trader);
+        await this.ensureTokenReady(trader, this.deployment.currency0);
+        await this.ensureTokenReady(trader, this.deployment.currency1);
+        await this.refreshTraderNonce(trader);
+        trader.ready = true;
+        trader.setupStatus = 'ready';
+        trader.lastError = undefined;
+        this.events.emit('token', `Trader ${trader.id} has faucet balances and swap approvals.`, { trader: trader.address });
+      } catch (error) {
+        trader.ready = false;
+        trader.setupStatus = 'blocked';
+        trader.lastError = cleanError(error);
+        this.events.emit('warning', `Trader ${trader.id} paused during setup: ${trader.lastError}`, { trader: trader.address });
+      }
     }
   }
 
   private async ensureTokenReady(trader: RuntimeTrader, token: Address) {
-    const { walletClient } = makeWalletClient(trader.privateKey, this.config.rpcUrl);
+    const { walletClient } = makeWalletClient(trader.privateKey, this.config.writeRpcUrl);
     const balance = await this.publicClient.readContract({
       address: token,
       abi: demoErc20Abi,
@@ -420,41 +485,76 @@ export class LiveDemoOrchestrator {
       args: [trader.address],
     });
     if (balance < TOKEN_READY_BALANCE) {
-      const hash = await walletClient.writeContract({ address: token, abi: demoErc20Abi, functionName: 'faucet', gas: 200_000n });
-      this.noteSubmitted();
-      await this.waitForSuccess(hash, `trader ${trader.id} faucet`);
+      const hash = await this.txCoordinator.send(trader.address, `trader ${trader.id} faucet`, (attempt) =>
+        walletClient.writeContract({
+          address: token,
+          abi: demoErc20Abi,
+          functionName: 'faucet',
+          gas: 200_000n,
+          nonce: attempt.nonce,
+          ...feeFields(attempt),
+        }),
+      );
+      this.noteConfirmedTx();
     }
 
-    const allowance = await this.publicClient.readContract({
-      address: token,
-      abi: demoErc20Abi,
-      functionName: 'allowance',
-      args: [trader.address, this.deployment.poolSwapTest],
-    });
+    const allowance = await this.readAllowance(trader.address, token);
     if (allowance < APPROVAL_FLOOR) {
-      const hash = await walletClient.writeContract({
-        address: token,
-        abi: demoErc20Abi,
-        functionName: 'approve',
-        args: [this.deployment.poolSwapTest, maxUint256],
-        gas: 200_000n,
-      });
-      this.noteSubmitted();
-      await this.waitForSuccess(hash, `trader ${trader.id} approve`);
+      try {
+        const hash = await this.txCoordinator.send(trader.address, `trader ${trader.id} approve`, (attempt) =>
+          walletClient.writeContract({
+            address: token,
+            abi: demoErc20Abi,
+            functionName: 'approve',
+            args: [this.deployment.poolSwapTest, maxUint256],
+            gas: 200_000n,
+            nonce: attempt.nonce,
+            ...feeFields(attempt),
+          }),
+        );
+        this.noteConfirmedTx();
+        this.events.emit('token', `Trader ${trader.id} approval confirmed.`, { trader: trader.address, txHash: hash });
+      } catch (error) {
+        if (error instanceof PendingNonceGapError) {
+          this.events.emit('warning', `Trader ${trader.id} has a pending nonce gap; re-checking allowance.`, {
+            trader: trader.address,
+          });
+        }
+        const latestAllowance = await this.readAllowance(trader.address, token);
+        if (latestAllowance >= APPROVAL_FLOOR) {
+          this.events.emit('token', `Trader ${trader.id} approval already satisfied after retry check.`, { trader: trader.address });
+          return;
+        }
+        throw error;
+      }
+    } else {
+      this.events.emit('token', `Trader ${trader.id} approval already satisfied.`, { trader: trader.address });
     }
   }
 
-  private async syncSnapshot() {
-    const hash = await this.deployer.walletClient.writeContract({
-      address: this.deployment.hook,
-      abi: productionHookAbi,
-      functionName: 'syncHedgeSnapshot',
-      args: [this.poolKey],
-      gas: 500_000n,
+  private async readAllowance(owner: Address, token: Address) {
+    return this.publicClient.readContract({
+      address: token,
+      abi: demoErc20Abi,
+      functionName: 'allowance',
+      args: [owner, this.deployment.poolSwapTest],
     });
-    this.noteSubmitted();
+  }
+
+  private async syncSnapshot() {
+    const hash = await this.txCoordinator.send(this.deployer.account.address, 'hook.syncHedgeSnapshot', (attempt) =>
+      this.deployer.walletClient.writeContract({
+        address: this.deployment.hook,
+        abi: productionHookAbi,
+        functionName: 'syncHedgeSnapshot',
+        args: [this.poolKey],
+        gas: 500_000n,
+        nonce: attempt.nonce,
+        ...feeFields(attempt),
+      }),
+    );
+    this.noteConfirmedTx();
     this.events.emit('keeper', 'Synced hedge snapshot.', { txHash: hash });
-    await this.waitForSuccess(hash, 'sync hedge snapshot');
   }
 
   private async readRiskState(): Promise<ProductionRiskState> {
@@ -495,9 +595,13 @@ export class LiveDemoOrchestrator {
             args: [trader.address],
           }),
         ]);
+        await this.refreshTraderNonce(trader).catch(() => undefined);
         return {
           id: trader.id,
           address: trader.address,
+          setupStatus: trader.setupStatus,
+          latestNonce: trader.latestNonce,
+          pendingNonce: trader.pendingNonce,
           nativeBalanceEth: formatEther(nativeBalance),
           token0Balance: formatUnits(token0Balance, 18),
           token1Balance: formatUnits(token1Balance, 18),
@@ -514,14 +618,29 @@ export class LiveDemoOrchestrator {
   }
 
   private async updatePoolPrice(toBlock: bigint) {
-    const fromBlock = this.#poolPrice.lastScannedBlock ? this.#poolPrice.lastScannedBlock + 1n : positive(toBlock - 150n);
+    const fromBlock = this.#poolPrice.lastScannedBlock
+      ? this.#poolPrice.lastScannedBlock + 1n
+      : initialBackfillFromBlock(toBlock, this.config.priceBackfillBlocks);
     if (fromBlock > toBlock) return;
-    const logs = await this.publicClient.getLogs({
-      address: this.deployment.poolManager,
-      event: poolManagerSwapEvent,
-      args: { id: this.deployment.poolId },
+    const logs = await collectLogsInChunks({
       fromBlock,
       toBlock,
+      maxSpan: this.config.getLogsBlockSpan,
+      getLogs: (range) =>
+        this.publicClient.getLogs({
+          address: this.deployment.poolManager,
+          event: poolManagerSwapEvent,
+          args: { id: this.deployment.poolId },
+          fromBlock: range.fromBlock,
+          toBlock: range.toBlock,
+        }),
+      onChunkError: (range, error) => {
+        this.#poolPrice.lastScannedBlock = nextBlockAfterFailedRange(range) - 1n;
+        this.events.emit(
+          'warning',
+          `Pool price log scan skipped blocks ${range.fromBlock}-${range.toBlock}: ${cleanError(error)}. Using adapter mark fallback.`,
+        );
+      },
     });
     this.#poolPrice.lastScannedBlock = toBlock;
     const last = logs.at(-1);
@@ -529,15 +648,6 @@ export class LiveDemoOrchestrator {
     const tick = Number(last.args.tick);
     this.#poolPrice.tick = tick;
     this.#poolPrice.priceUsd = tickToBaseQuotePrice(tick, this.deployment.baseIsCurrency0);
-  }
-
-  private async waitForSuccess(hash: Hex, label: string) {
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
-    if (receipt.status !== 'success') {
-      this.noteFailed();
-      throw new Error(`${label} reverted: ${hash}`);
-    }
-    this.noteConfirmed();
   }
 
   private async waitForRateSlot() {
@@ -566,14 +676,20 @@ export class LiveDemoOrchestrator {
       swapsFailed: 0,
       ready: false,
       busy: false,
+      setupStatus: 'setup',
+      latestNonce: 0,
+      pendingNonce: 0,
     };
   }
 
-  private noteSubmitted() {
-    this.#txSubmitted++;
+  private async refreshTraderNonce(trader: RuntimeTrader) {
+    const snapshot = await this.txCoordinator.nonces(trader.address);
+    trader.latestNonce = snapshot.latestNonce;
+    trader.pendingNonce = snapshot.pendingNonce;
   }
 
-  private noteConfirmed() {
+  private noteConfirmedTx() {
+    this.#txSubmitted++;
     this.#txConfirmed++;
   }
 
@@ -585,6 +701,13 @@ export class LiveDemoOrchestrator {
 function computeAcceptablePrice(markPrice: bigint, hedgeBaseDelta: bigint, slippageBps: bigint) {
   if (hedgeBaseDelta > 0n) return (markPrice * (10_000n + slippageBps)) / 10_000n;
   return (markPrice * (10_000n - slippageBps)) / 10_000n;
+}
+
+function feeFields(attempt: { maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint }) {
+  return {
+    ...(attempt.maxFeePerGas !== undefined ? { maxFeePerGas: attempt.maxFeePerGas } : {}),
+    ...(attempt.maxPriorityFeePerGas !== undefined ? { maxPriorityFeePerGas: attempt.maxPriorityFeePerGas } : {}),
+  };
 }
 
 function positive(value: bigint) {

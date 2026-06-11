@@ -3,9 +3,12 @@ import {
   computeAcceptablePrice,
   decideHedgeFill,
   decideProductionAction,
+  isSnapshotStale,
+  snapshotAgeSeconds,
   type ProductionRiskState,
   type RiskState,
 } from './risk.js';
+import { productionHookAbi } from './abi.js';
 
 const baseState: RiskState = {
   poolBaseExposure: 0n,
@@ -127,11 +130,13 @@ const productionBaseState: ProductionRiskState = {
 };
 
 describe('decideProductionAction', () => {
+  const productionConfig = { hedgeThresholdBase: 100n, maxSnapshotAge: 300n };
+
   it('skips when the keeper is not authorized', () => {
     const decision = decideProductionAction({
       keeperAllowed: false,
       state: productionBaseState,
-      config: { hedgeThresholdBase: 100n },
+      config: productionConfig,
       now: 10n,
       maxHedgeSlippageBps: 100n,
     });
@@ -150,7 +155,7 @@ describe('decideProductionAction', () => {
     const decision = decideProductionAction({
       keeperAllowed: true,
       state,
-      config: { hedgeThresholdBase: 100n },
+      config: productionConfig,
       now: 10n,
       maxHedgeSlippageBps: 100n,
     });
@@ -167,7 +172,7 @@ describe('decideProductionAction', () => {
         pendingOrderBase: 1_000n,
         pendingOrderReadyAt: 20n,
       },
-      config: { hedgeThresholdBase: 100n },
+      config: productionConfig,
       now: 10n,
       maxHedgeSlippageBps: 100n,
     });
@@ -179,14 +184,14 @@ describe('decideProductionAction', () => {
     const inside = decideProductionAction({
       keeperAllowed: true,
       state: { ...productionBaseState, netBaseDelta: 99n },
-      config: { hedgeThresholdBase: 100n },
+      config: productionConfig,
       now: 10n,
       maxHedgeSlippageBps: 100n,
     });
     const outside = decideProductionAction({
       keeperAllowed: true,
-      state: { ...productionBaseState, netBaseDelta: 101n, lastMarkPrice: 2_000n },
-      config: { hedgeThresholdBase: 100n },
+      state: { ...productionBaseState, netBaseDelta: 101n, lastMarkPrice: 2_000n, lastSnapshotTimestamp: 9n },
+      config: productionConfig,
       now: 10n,
       maxHedgeSlippageBps: 100n,
     });
@@ -198,5 +203,63 @@ describe('decideProductionAction', () => {
   it('computes acceptable prices for long and short hedge deltas', () => {
     expect(computeAcceptablePrice(2_000n, 1n, 100n)).toBe(2_020n);
     expect(computeAcceptablePrice(2_000n, -1n, 100n)).toBe(1_980n);
+  });
+
+  it('skips stale defensive snapshots instead of rebalancing', () => {
+    const state = {
+      ...productionBaseState,
+      netBaseDelta: -1_000n,
+      lastSnapshotTimestamp: 1n,
+      adapterHealthy: true,
+      healthMode: 3,
+    };
+
+    const decision = decideProductionAction({
+      keeperAllowed: true,
+      state,
+      config: productionConfig,
+      now: 1_000n,
+      maxHedgeSlippageBps: 100n,
+    });
+
+    expect(snapshotAgeSeconds(state, 1_000n)).toBe(999n);
+    expect(isSnapshotStale(state, productionConfig, 1_000n)).toBe(true);
+    expect(decision).toMatchObject({ kind: 'skip', reason: 'stale-snapshot' });
+  });
+
+  it('settles ready pending orders even when the pool is defensive', () => {
+    const state = {
+      ...productionBaseState,
+      pendingOrderId: `0x${'3'.repeat(64)}` as `0x${string}`,
+      pendingOrderBase: 1_000n,
+      pendingOrderReadyAt: 10n,
+      healthMode: 3,
+    };
+
+    const decision = decideProductionAction({
+      keeperAllowed: true,
+      state,
+      config: productionConfig,
+      now: 10n,
+      maxHedgeSlippageBps: 100n,
+    });
+
+    expect(decision).toMatchObject({ kind: 'settle', orderId: state.pendingOrderId });
+  });
+
+  it('skips defensive pools with fresh snapshots instead of rebalancing', () => {
+    const decision = decideProductionAction({
+      keeperAllowed: true,
+      state: { ...productionBaseState, netBaseDelta: -1_000n, lastSnapshotTimestamp: 9n, healthMode: 3 },
+      config: productionConfig,
+      now: 10n,
+      maxHedgeSlippageBps: 100n,
+    });
+
+    expect(decision).toMatchObject({ kind: 'skip', reason: 'defensive' });
+  });
+
+  it('includes the production HedgeAdapterUnhealthy custom error in the ABI', () => {
+    expect(productionHookAbi).toContainEqual({ type: 'error', name: 'HedgeAdapterUnhealthy', inputs: [] });
   });
 });
