@@ -8,3 +8,6 @@ frontend/.env.local
 frontend/.env*.local
 frontend/.next/
 frontend/node_modules/
+keeper/node_modules/
+keeper/coverage/
+report*.md
