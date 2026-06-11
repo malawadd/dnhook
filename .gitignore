@@ -1,0 +1,10 @@
+/cache/
+/out/
+/broadcast/
+.env
+.env.*
+!.env.example
+frontend/.env.local
+frontend/.env*.local
+frontend/.next/
+frontend/node_modules/
