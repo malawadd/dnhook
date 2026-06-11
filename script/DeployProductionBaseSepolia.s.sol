@@ -36,6 +36,8 @@ contract DeployProductionBaseSepolia is Script {
     uint256 internal constant HEDGE_THRESHOLD_BASE = 0.01 ether;
     uint256 internal constant MAX_RESIDUAL_DELTA_BASE = 0.005 ether;
     uint256 internal constant MAX_PENDING_ORDER_AGE = 1 hours;
+    uint256 internal constant MAX_SNAPSHOT_AGE = 5 minutes;
+    uint256 internal constant MIN_COLLATERAL_USD = 1_000 ether;
     uint256 internal constant MIN_COLLATERAL_RATIO_BPS = 5_000;
     uint256 internal constant MAX_LEVERAGE_BPS = 300_000;
     uint256 internal constant MAX_LOSS_BPS = 2_000;
@@ -50,7 +52,8 @@ contract DeployProductionBaseSepolia is Script {
 
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                | Hooks.AFTER_SWAP_FLAG
         );
 
         vm.startBroadcast(deployerPrivateKey);
@@ -143,6 +146,8 @@ contract DeployProductionBaseSepolia is Script {
                 hedgeThresholdBase: HEDGE_THRESHOLD_BASE,
                 maxResidualDeltaBase: MAX_RESIDUAL_DELTA_BASE,
                 maxPendingOrderAge: MAX_PENDING_ORDER_AGE,
+                maxSnapshotAge: MAX_SNAPSHOT_AGE,
+                minCollateralUsd: MIN_COLLATERAL_USD,
                 minCollateralRatioBps: MIN_COLLATERAL_RATIO_BPS,
                 maxLeverageBps: MAX_LEVERAGE_BPS,
                 maxLossBps: MAX_LOSS_BPS
@@ -189,6 +194,8 @@ contract DeployProductionBaseSepolia is Script {
         json = vm.serializeString(object, "hedgeThresholdBase", vm.toString(HEDGE_THRESHOLD_BASE));
         json = vm.serializeString(object, "maxResidualDeltaBase", vm.toString(MAX_RESIDUAL_DELTA_BASE));
         json = vm.serializeUint(object, "maxPendingOrderAge", MAX_PENDING_ORDER_AGE);
+        json = vm.serializeUint(object, "maxSnapshotAge", MAX_SNAPSHOT_AGE);
+        json = vm.serializeString(object, "minCollateralUsd", vm.toString(MIN_COLLATERAL_USD));
         json = vm.serializeUint(object, "minCollateralRatioBps", MIN_COLLATERAL_RATIO_BPS);
         json = vm.serializeUint(object, "maxLeverageBps", MAX_LEVERAGE_BPS);
         json = vm.serializeUint(object, "maxLossBps", MAX_LOSS_BPS);

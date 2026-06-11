@@ -4,7 +4,11 @@ import { fileURLToPath } from 'node:url';
 import type { Address } from 'viem';
 
 const keeperDir = dirname(fileURLToPath(import.meta.url));
-const defaultDeploymentPath = resolve(keeperDir, '../../deployments/sepolia.json');
+const deploymentRoot = resolve(keeperDir, '../../deployments');
+const defaultCapstoneDeploymentPath = resolve(deploymentRoot, 'sepolia.json');
+const defaultProductionDeploymentPath = resolve(deploymentRoot, 'base-sepolia-production.json');
+
+export type HookMode = 'capstone' | 'production';
 
 export type Deployment = {
   chainId: number;
@@ -28,7 +32,11 @@ export type PoolKey = {
   hooks: Address;
 };
 
-export function loadDeployment(path = process.env.DEPLOYMENT_PATH ?? defaultDeploymentPath): Deployment {
+export function defaultDeploymentPath(mode: HookMode) {
+  return mode === 'production' ? defaultProductionDeploymentPath : defaultCapstoneDeploymentPath;
+}
+
+export function loadDeployment(mode: HookMode, path = process.env.DEPLOYMENT_PATH ?? defaultDeploymentPath(mode)): Deployment {
   return JSON.parse(readFileSync(path, 'utf8')) as Deployment;
 }
 

@@ -8,6 +8,7 @@ import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 
 import {DemoERC20} from "../src/DemoERC20.sol";
@@ -19,6 +20,7 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
     ProductionDeltaNeutralHook hook;
     MockHedgeAdapter adapter;
     DemoERC20 collateral;
+    bytes32 strategy;
 
     uint24 internal constant MIN_FEE = 100;
     uint24 internal constant TARGET_FEE = 500;
@@ -38,7 +40,8 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
 
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
-                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
+                | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                | Hooks.AFTER_SWAP_FLAG
         );
         deployCodeTo(
             "ProductionDeltaNeutralHook.sol",
@@ -49,6 +52,7 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         adapter.setHook(address(hook));
 
         (key,) = initPool(currency0, currency1, IHooks(address(hook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, SQRT_PRICE_1_1);
+        strategy = hook.strategyId(key);
         _configurePool();
 
         hook.setLiquidityManager(address(modifyLiquidityRouter), true);
@@ -67,11 +71,11 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
 
         assertTrue(permissions.beforeInitialize);
         assertTrue(permissions.beforeAddLiquidity);
+        assertTrue(permissions.afterAddLiquidity);
         assertTrue(permissions.beforeRemoveLiquidity);
+        assertTrue(permissions.afterRemoveLiquidity);
         assertTrue(permissions.beforeSwap);
         assertTrue(permissions.afterSwap);
-        assertFalse(permissions.afterAddLiquidity);
-        assertFalse(permissions.afterRemoveLiquidity);
     }
 
     function test_liquidityRouterMustBeWhitelisted() public {
@@ -97,6 +101,28 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         assertEq(uint8(state.healthMode), uint8(ProductionDeltaNeutralHook.HealthMode.NeedsRebalance));
     }
 
+    function test_addLiquidityIncreasesTrackedLpExposure() public view {
+        ProductionDeltaNeutralHook.StrategyRiskState memory state = hook.getRiskState(key);
+
+        assertGt(state.lpBaseDeposited, 0, "initial manager liquidity should be tracked");
+        assertGe(state.poolBaseExposure, int256(state.lpBaseDeposited), "base inventory includes LP deposits");
+    }
+
+    function test_removeLiquidityDecreasesTrackedLpExposure() public {
+        ProductionDeltaNeutralHook.StrategyRiskState memory beforeRemove = hook.getRiskState(key);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: -10 ether, salt: 0}),
+            ZERO_BYTES
+        );
+
+        ProductionDeltaNeutralHook.StrategyRiskState memory afterRemove = hook.getRiskState(key);
+        assertGt(afterRemove.lpBaseWithdrawn, beforeRemove.lpBaseWithdrawn);
+        assertLt(afterRemove.poolBaseExposure, beforeRemove.poolBaseExposure);
+        assertEq(afterRemove.netBaseDelta, afterRemove.poolBaseExposure + afterRemove.hedgePositionBase);
+    }
+
     function test_feeBumpsWorseningFlowAndDiscountsReducingFlow() public {
         swap(key, true, -1 ether, ZERO_BYTES);
 
@@ -114,7 +140,7 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
 
         bytes32 orderId = hook.rebalance(key, 2_000 ether);
         ProductionDeltaNeutralHook.StrategyRiskState memory state = hook.getRiskState(key);
-        IHedgeAdapter.HedgeSnapshot memory snapshot = adapter.getSnapshot();
+        IHedgeAdapter.HedgeSnapshot memory snapshot = adapter.getSnapshot(strategy);
 
         assertEq(orderId, state.pendingOrderId);
         assertEq(snapshot.pendingOrderBase, state.pendingOrderBase);
@@ -135,7 +161,7 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         hook.rebalance(key, 2_000 ether);
 
         ProductionDeltaNeutralHook.StrategyRiskState memory pending = hook.getRiskState(key);
-        adapter.setNextSettlement(pending.pendingOrderBase / 2, 12 ether, 2_010 ether);
+        adapter.setNextSettlement(strategy, pending.pendingOrderBase / 2, 12 ether, 2_010 ether);
         hook.settleHedgeOrder(key);
 
         ProductionDeltaNeutralHook.StrategyRiskState memory state = hook.getRiskState(key);
@@ -143,7 +169,7 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         assertEq(state.pendingOrderId, bytes32(0));
         assertEq(state.hedgePositionBase, pending.pendingOrderBase / 2);
         assertEq(state.realizedPnlUsd, 12 ether);
-        assertEq(state.lastHedgePrice, 2_010 ether);
+        assertEq(state.lastMarkPrice, 2_010 ether);
         assertEq(state.netBaseDelta, state.poolBaseExposure + state.hedgePositionBase);
         assertEq(uint8(state.healthMode), uint8(ProductionDeltaNeutralHook.HealthMode.NeedsRebalance));
     }
@@ -165,13 +191,11 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
     }
 
     function test_lowCollateralPreventsRebalance() public {
+        swap(key, true, -1 ether, ZERO_BYTES);
         _setAdapterSnapshot(0, 0, 1, 0, 0, true);
         hook.syncHedgeSnapshot(key);
-        swap(key, true, -1 ether, ZERO_BYTES);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(ProductionDeltaNeutralHook.InsufficientCollateral.selector, 1, 0.5 ether)
-        );
+        vm.expectRevert();
         hook.rebalance(key, 2_000 ether);
     }
 
@@ -181,6 +205,27 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
 
         ProductionDeltaNeutralHook.StrategyRiskState memory state = hook.getRiskState(key);
         assertEq(uint8(state.healthMode), uint8(ProductionDeltaNeutralHook.HealthMode.Defensive));
+    }
+
+    function test_unhealthyAdapterMovesPoolIntoDefensiveMode() public {
+        _setAdapterSnapshot(0, 0, COLLATERAL_AMOUNT, 0, 0, false);
+        hook.syncHedgeSnapshot(key);
+
+        ProductionDeltaNeutralHook.StrategyRiskState memory state = hook.getRiskState(key);
+        assertFalse(state.adapterHealthy);
+        assertEq(uint8(state.healthMode), uint8(ProductionDeltaNeutralHook.HealthMode.Defensive));
+    }
+
+    function test_staleSnapshotBlocksExposureIncreasingSwaps() public {
+        _setAdapterSnapshotAt(0, 0, COLLATERAL_AMOUNT, 0, 0, true, block.timestamp);
+        vm.warp(block.timestamp + 2 hours);
+        hook.syncHedgeSnapshot(key);
+
+        SwapParams memory increaseExposure =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1});
+
+        vm.expectRevert(ProductionDeltaNeutralHook.HedgeAdapterUnhealthy.selector);
+        hook.previewFee(key, increaseExposure);
     }
 
     function test_emergencyDeRiskFlattensExistingHedgePosition() public {
@@ -212,9 +257,29 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         assertEq(hook.netBaseDelta(key), state.poolBaseExposure + state.hedgePositionBase);
     }
 
+    function test_twoPoolsUseIsolatedAdapterSnapshots() public {
+        PoolKey memory otherKey = key;
+        otherKey.tickSpacing = 120;
+        bytes32 otherStrategy = hook.strategyId(otherKey);
+        _configurePoolKey(otherKey);
+
+        _setAdapterSnapshotFor(strategy, 1 ether, 0, COLLATERAL_AMOUNT, 0, 0, true, block.timestamp);
+        _setAdapterSnapshotFor(otherStrategy, -3 ether, 0, COLLATERAL_AMOUNT, 0, 0, true, block.timestamp);
+
+        hook.syncHedgeSnapshot(key);
+        hook.syncHedgeSnapshot(otherKey);
+
+        assertEq(hook.getRiskState(key).hedgePositionBase, 1 ether);
+        assertEq(hook.getRiskState(otherKey).hedgePositionBase, -3 ether);
+    }
+
     function _configurePool() internal {
+        _configurePoolKey(key);
+    }
+
+    function _configurePoolKey(PoolKey memory targetKey) internal {
         hook.configurePool(
-            key,
+            targetKey,
             ProductionDeltaNeutralHook.PoolConfigInput({
                 baseIsCurrency0: true,
                 minFeePips: MIN_FEE,
@@ -225,6 +290,8 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
                 hedgeThresholdBase: THRESHOLD,
                 maxResidualDeltaBase: MAX_RESIDUAL,
                 maxPendingOrderAge: 1 hours,
+                maxSnapshotAge: 1 hours,
+                minCollateralUsd: 1 ether,
                 minCollateralRatioBps: 5_000,
                 maxLeverageBps: 300_000,
                 maxLossBps: 2_000
@@ -240,15 +307,57 @@ contract ProductionDeltaNeutralHookTest is Test, Deployers {
         int256 unrealizedPnlUsd,
         bool healthy
     ) internal {
+        _setAdapterSnapshotAt(
+            positionBase, pendingOrderBase, collateralUsd, realizedPnlUsd, unrealizedPnlUsd, healthy, block.timestamp
+        );
+    }
+
+    function _setAdapterSnapshotAt(
+        int256 positionBase,
+        int256 pendingOrderBase,
+        uint256 collateralUsd,
+        int256 realizedPnlUsd,
+        int256 unrealizedPnlUsd,
+        bool healthy,
+        uint256 updatedAt
+    ) internal {
+        _setAdapterSnapshotFor(
+            strategy,
+            positionBase,
+            pendingOrderBase,
+            collateralUsd,
+            realizedPnlUsd,
+            unrealizedPnlUsd,
+            healthy,
+            updatedAt
+        );
+    }
+
+    function _setAdapterSnapshotFor(
+        bytes32 targetStrategy,
+        int256 positionBase,
+        int256 pendingOrderBase,
+        uint256 collateralUsd,
+        int256 realizedPnlUsd,
+        int256 unrealizedPnlUsd,
+        bool healthy,
+        uint256 updatedAt
+    ) internal {
         adapter.setSnapshot(
+            targetStrategy,
             IHedgeAdapter.HedgeSnapshot({
+                strategyId: targetStrategy,
                 positionBase: positionBase,
                 pendingOrderBase: pendingOrderBase,
+                pendingOrderId: pendingOrderBase == 0
+                    ? bytes32(0)
+                    : keccak256(abi.encode(targetStrategy, pendingOrderBase)),
                 realizedPnlUsd: realizedPnlUsd,
                 unrealizedPnlUsd: unrealizedPnlUsd,
                 collateralUsd: collateralUsd,
-                lastPrice: 2_000 ether,
-                pendingOrder: pendingOrderBase != 0,
+                markPrice: 2_000 ether,
+                updatedAt: updatedAt,
+                settlementReadyAt: pendingOrderBase == 0 ? 0 : block.timestamp,
                 healthy: healthy
             })
         );

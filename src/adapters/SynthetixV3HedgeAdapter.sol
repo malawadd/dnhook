@@ -20,7 +20,7 @@ contract SynthetixV3HedgeAdapter is ISynthetixV3PerpsAdapter {
     uint128 public immutable override synthMarketId;
     address public hook;
 
-    HedgeSnapshot internal latestSnapshot;
+    mapping(bytes32 strategyId => HedgeSnapshot snapshot) internal latestSnapshots;
     bytes32 public latestOrderId;
 
     error NotHook();
@@ -54,7 +54,7 @@ contract SynthetixV3HedgeAdapter is ISynthetixV3PerpsAdapter {
         hook = _hook;
     }
 
-    function depositCollateral(address token, uint256 amount)
+    function depositCollateral(bytes32 strategyId, address token, uint256 amount)
         external
         override
         onlyHook
@@ -64,12 +64,15 @@ contract SynthetixV3HedgeAdapter is ISynthetixV3PerpsAdapter {
         IERC20Minimal(token).transferFrom(msg.sender, address(this), amount);
         IERC20Minimal(token).approve(perpsMarketProxy, amount);
         ISynthetixPerpsV3Proxy(perpsMarketProxy).modifyCollateral(accountId, synthMarketId, int256(amount));
-        latestSnapshot.collateralUsd += amount;
-        emit CollateralDeposited(msg.sender, token, amount);
-        return latestSnapshot.collateralUsd;
+        HedgeSnapshot storage snapshot = latestSnapshots[strategyId];
+        snapshot.strategyId = strategyId;
+        snapshot.collateralUsd += amount;
+        snapshot.updatedAt = block.timestamp;
+        emit CollateralDeposited(strategyId, msg.sender, token, amount);
+        return snapshot.collateralUsd;
     }
 
-    function withdrawCollateral(address token, address to, uint256 amount)
+    function withdrawCollateral(bytes32 strategyId, address token, address to, uint256 amount)
         external
         override
         onlyHook
@@ -78,24 +81,33 @@ contract SynthetixV3HedgeAdapter is ISynthetixV3PerpsAdapter {
         if (token != collateralToken || to == address(0)) revert ZeroAddress();
         ISynthetixPerpsV3Proxy(perpsMarketProxy).modifyCollateral(accountId, synthMarketId, -int256(amount));
         IERC20Minimal(token).transfer(to, amount);
-        latestSnapshot.collateralUsd = amount > latestSnapshot.collateralUsd ? 0 : latestSnapshot.collateralUsd - amount;
-        emit CollateralWithdrawn(msg.sender, token, to, amount);
-        return latestSnapshot.collateralUsd;
+        HedgeSnapshot storage snapshot = latestSnapshots[strategyId];
+        snapshot.strategyId = strategyId;
+        snapshot.collateralUsd = amount > snapshot.collateralUsd ? 0 : snapshot.collateralUsd - amount;
+        snapshot.updatedAt = block.timestamp;
+        emit CollateralWithdrawn(strategyId, msg.sender, token, to, amount);
+        return snapshot.collateralUsd;
     }
 
-    function commitHedge(int256, uint256) external pure override returns (bytes32) {
+    function commitHedge(bytes32, int256, uint256) external pure override returns (bytes32) {
         revert SynthetixCommitNotWired();
     }
 
-    function settleHedge(bytes32 orderId) external override onlyHook returns (HedgeSnapshot memory snapshot) {
+    function settleHedge(bytes32 strategyId, bytes32 orderId)
+        external
+        override
+        onlyHook
+        returns (HedgeSnapshot memory snapshot)
+    {
         ISynthetixPerpsV3Proxy(perpsMarketProxy).settleOrder(accountId);
-        latestSnapshot.pendingOrder = false;
-        latestSnapshot.pendingOrderBase = 0;
-        emit HedgeOrderSettled(orderId, 0, latestSnapshot.realizedPnlUsd);
-        return latestSnapshot;
+        latestSnapshots[strategyId].pendingOrderId = bytes32(0);
+        latestSnapshots[strategyId].pendingOrderBase = 0;
+        latestSnapshots[strategyId].updatedAt = block.timestamp;
+        emit HedgeOrderSettled(strategyId, orderId, 0, latestSnapshots[strategyId].realizedPnlUsd);
+        return latestSnapshots[strategyId];
     }
 
-    function getSnapshot() external view override returns (HedgeSnapshot memory snapshot) {
-        return latestSnapshot;
+    function getSnapshot(bytes32 strategyId) external view override returns (HedgeSnapshot memory snapshot) {
+        return latestSnapshots[strategyId];
     }
 }

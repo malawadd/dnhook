@@ -15,12 +15,14 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {IERC20Minimal} from "./interfaces/IERC20Minimal.sol";
 import {IHedgeAdapter} from "./interfaces/IHedgeAdapter.sol";
 
-/// @notice Production-oriented delta-neutral v4 hook with collateral custody and async hedge lifecycle.
+/// @notice Production-oriented delta-neutral v4 hook with LP inventory accounting and async hedge lifecycle.
 /// @dev The hook owns risk policy. The adapter owns venue-specific hedge mechanics.
 contract ProductionDeltaNeutralHook is IHooks {
     using BalanceDeltaLibrary for BalanceDelta;
     using LPFeeLibrary for uint24;
     using PoolIdLibrary for PoolKey;
+
+    uint256 internal constant PRICE_SCALE = 1e18;
 
     enum HealthMode {
         Healthy,
@@ -40,6 +42,8 @@ contract ProductionDeltaNeutralHook is IHooks {
         uint256 hedgeThresholdBase;
         uint256 maxResidualDeltaBase;
         uint256 maxPendingOrderAge;
+        uint256 maxSnapshotAge;
+        uint256 minCollateralUsd;
         uint256 minCollateralRatioBps;
         uint256 maxLeverageBps;
         uint256 maxLossBps;
@@ -56,6 +60,8 @@ contract ProductionDeltaNeutralHook is IHooks {
         uint256 hedgeThresholdBase;
         uint256 maxResidualDeltaBase;
         uint256 maxPendingOrderAge;
+        uint256 maxSnapshotAge;
+        uint256 minCollateralUsd;
         uint256 minCollateralRatioBps;
         uint256 maxLeverageBps;
         uint256 maxLossBps;
@@ -71,9 +77,15 @@ contract ProductionDeltaNeutralHook is IHooks {
         int256 unrealizedPnlUsd;
         uint256 collateralUsd;
         uint256 initialCollateralUsd;
-        uint256 lastHedgePrice;
+        uint256 lastMarkPrice;
+        uint256 lastSnapshotTimestamp;
+        uint256 pendingOrderReadyAt;
         uint256 lastRebalanceTimestamp;
+        uint256 lpBaseDeposited;
+        uint256 lpBaseWithdrawn;
+        uint256 lpBaseFeesAccrued;
         bytes32 pendingOrderId;
+        bool adapterHealthy;
         HealthMode healthMode;
     }
 
@@ -84,8 +96,8 @@ contract ProductionDeltaNeutralHook is IHooks {
     address public strategyManager;
     bool internal locked;
 
-    mapping(PoolId poolId => PoolConfig config) public poolConfigs;
-    mapping(PoolId poolId => StrategyRiskState state) public riskStates;
+    mapping(PoolId poolId => PoolConfig config) internal poolConfigs;
+    mapping(PoolId poolId => StrategyRiskState state) internal riskStates;
     mapping(address account => bool allowed) public keepers;
     mapping(address account => bool allowed) public liquidityManagers;
 
@@ -120,6 +132,9 @@ contract ProductionDeltaNeutralHook is IHooks {
     );
     event EmergencyDeRiskRequested(bytes32 indexed poolId, bytes32 indexed orderId, int256 hedgeDeltaBase);
     event FeeUpdated(bytes32 indexed poolId, uint24 feePips, bool exposureIncreasing, HealthMode healthMode);
+    event LiquidityInventoryUpdated(
+        bytes32 indexed poolId, bool adding, int256 principalBaseDelta, int256 feeBaseDelta, int256 poolBaseExposure
+    );
 
     error NotOwner();
     error NotManager();
@@ -138,6 +153,7 @@ contract ProductionDeltaNeutralHook is IHooks {
     error InsufficientCollateral(uint256 collateralUsd, uint256 requiredUsd);
     error MaxLossExceeded(int256 pnlUsd, uint256 maxLossUsd);
     error HedgeAdapterUnhealthy();
+    error OrderIdMismatch(bytes32 expected, bytes32 actual);
     error Reentrancy();
 
     modifier onlyOwner() {
@@ -203,9 +219,9 @@ contract ProductionDeltaNeutralHook is IHooks {
             beforeInitialize: true,
             afterInitialize: false,
             beforeAddLiquidity: true,
-            afterAddLiquidity: false,
+            afterAddLiquidity: true,
             beforeRemoveLiquidity: true,
-            afterRemoveLiquidity: false,
+            afterRemoveLiquidity: true,
             beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
@@ -255,25 +271,12 @@ contract ProductionDeltaNeutralHook is IHooks {
         if (!input.maxFeePips.isValid()) revert InvalidFeeConfig();
         if (
             input.hedgeThresholdBase == 0 || input.maxResidualDeltaBase > input.hedgeThresholdBase
-                || input.minCollateralRatioBps == 0 || input.maxLeverageBps == 0 || input.maxLossBps > 10_000
+                || input.maxSnapshotAge == 0 || input.minCollateralRatioBps == 0 || input.maxLeverageBps == 0
+                || input.maxLossBps > 10_000
         ) revert InvalidRiskConfig();
 
         PoolId poolId = key.toId();
-        poolConfigs[poolId] = PoolConfig({
-            configured: true,
-            baseIsCurrency0: input.baseIsCurrency0,
-            minFeePips: input.minFeePips,
-            targetFeePips: input.targetFeePips,
-            maxFeePips: input.maxFeePips,
-            inventoryFeeBumpPips: input.inventoryFeeBumpPips,
-            inventoryFeeDiscountPips: input.inventoryFeeDiscountPips,
-            hedgeThresholdBase: input.hedgeThresholdBase,
-            maxResidualDeltaBase: input.maxResidualDeltaBase,
-            maxPendingOrderAge: input.maxPendingOrderAge,
-            minCollateralRatioBps: input.minCollateralRatioBps,
-            maxLeverageBps: input.maxLeverageBps,
-            maxLossBps: input.maxLossBps
-        });
+        _storePoolConfig(poolId, input);
 
         riskStates[poolId].healthMode = HealthMode.Healthy;
         emit PoolConfigured(PoolId.unwrap(poolId), input.baseIsCurrency0, input.targetFeePips);
@@ -286,19 +289,40 @@ contract ProductionDeltaNeutralHook is IHooks {
         emit PoolPaused(PoolId.unwrap(poolId), paused);
     }
 
+    function _storePoolConfig(PoolId poolId, PoolConfigInput calldata input) internal {
+        PoolConfig storage config = poolConfigs[poolId];
+        config.configured = true;
+        config.baseIsCurrency0 = input.baseIsCurrency0;
+        config.minFeePips = input.minFeePips;
+        config.targetFeePips = input.targetFeePips;
+        config.maxFeePips = input.maxFeePips;
+        config.inventoryFeeBumpPips = input.inventoryFeeBumpPips;
+        config.inventoryFeeDiscountPips = input.inventoryFeeDiscountPips;
+        config.hedgeThresholdBase = input.hedgeThresholdBase;
+        config.maxResidualDeltaBase = input.maxResidualDeltaBase;
+        config.maxPendingOrderAge = input.maxPendingOrderAge;
+        config.maxSnapshotAge = input.maxSnapshotAge;
+        config.minCollateralUsd = input.minCollateralUsd;
+        config.minCollateralRatioBps = input.minCollateralRatioBps;
+        config.maxLeverageBps = input.maxLeverageBps;
+        config.maxLossBps = input.maxLossBps;
+    }
+
     function depositCollateral(PoolKey calldata key, uint256 amount) external onlyManager nonReentrant {
         require(amount > 0, "amount is zero");
         PoolId poolId = key.toId();
-        _requireConfigured(poolId);
+        PoolConfig storage config = _requireConfigured(poolId);
 
         collateralToken.transferFrom(msg.sender, address(this), amount);
         collateralToken.approve(address(hedgeAdapter), amount);
-        uint256 collateralUsd = hedgeAdapter.depositCollateral(address(collateralToken), amount);
+        uint256 collateralUsd = hedgeAdapter.depositCollateral(PoolId.unwrap(poolId), address(collateralToken), amount);
         StrategyRiskState storage state = riskStates[poolId];
         state.collateralUsd = collateralUsd;
         if (state.initialCollateralUsd == 0 || collateralUsd > state.initialCollateralUsd) {
             state.initialCollateralUsd = collateralUsd;
         }
+        _refreshSnapshot(poolId, state);
+        _applyHealth(config, state);
         emit CollateralDeposited(amount, collateralUsd);
     }
 
@@ -310,8 +334,10 @@ contract ProductionDeltaNeutralHook is IHooks {
         _refreshSnapshot(poolId, state);
         _requireHealthyCollateral(config, state, 0);
 
-        uint256 collateralUsd = hedgeAdapter.withdrawCollateral(address(collateralToken), to, amount);
+        uint256 collateralUsd =
+            hedgeAdapter.withdrawCollateral(PoolId.unwrap(poolId), address(collateralToken), to, amount);
         state.collateralUsd = collateralUsd;
+        _refreshSnapshot(poolId, state);
         _applyHealth(config, state);
         emit CollateralWithdrawn(to, amount, collateralUsd);
     }
@@ -326,6 +352,7 @@ contract ProductionDeltaNeutralHook is IHooks {
         PoolConfig storage config = _requireConfigured(poolId);
         StrategyRiskState storage state = riskStates[poolId];
         _refreshSnapshot(poolId, state);
+        _applyHealth(config, state);
 
         if (state.pendingOrderId != bytes32(0) || state.pendingOrderBase != 0) {
             revert PendingOrderExists(state.pendingOrderId);
@@ -335,11 +362,16 @@ contract ProductionDeltaNeutralHook is IHooks {
         if (hedgeDeltaBase == 0) revert NoRebalanceNeeded();
         _requireHealthyCollateral(config, state, hedgeDeltaBase);
 
-        orderId = hedgeAdapter.commitHedge(hedgeDeltaBase, acceptablePrice);
+        orderId = hedgeAdapter.commitHedge(PoolId.unwrap(poolId), hedgeDeltaBase, acceptablePrice);
         state.pendingOrderId = orderId;
         state.pendingOrderBase = hedgeDeltaBase;
         state.targetHedgeBase = state.hedgePositionBase + hedgeDeltaBase;
         state.lastRebalanceTimestamp = block.timestamp;
+        _refreshSnapshot(poolId, state);
+        if (state.pendingOrderId == bytes32(0)) {
+            state.pendingOrderId = orderId;
+            state.pendingOrderBase = hedgeDeltaBase;
+        }
         state.healthMode = HealthMode.PendingOrder;
 
         emit HedgeOrderCommitted(PoolId.unwrap(poolId), orderId, hedgeDeltaBase);
@@ -352,9 +384,14 @@ contract ProductionDeltaNeutralHook is IHooks {
         bytes32 orderId = state.pendingOrderId;
         if (orderId == bytes32(0)) revert NoPendingOrder();
 
-        IHedgeAdapter.HedgeSnapshot memory snapshot = hedgeAdapter.settleHedge(orderId);
+        IHedgeAdapter.HedgeSnapshot memory beforeSnapshot = hedgeAdapter.getSnapshot(PoolId.unwrap(poolId));
+        if (beforeSnapshot.pendingOrderId != orderId) {
+            revert OrderIdMismatch(orderId, beforeSnapshot.pendingOrderId);
+        }
+
+        IHedgeAdapter.HedgeSnapshot memory snapshot = hedgeAdapter.settleHedge(PoolId.unwrap(poolId), orderId);
         _applySnapshot(state, snapshot);
-        if (!snapshot.pendingOrder) {
+        if (snapshot.pendingOrderId == bytes32(0)) {
             state.pendingOrderId = bytes32(0);
             state.pendingOrderBase = 0;
         }
@@ -390,11 +427,16 @@ contract ProductionDeltaNeutralHook is IHooks {
         int256 hedgeDeltaBase = -state.hedgePositionBase;
         if (hedgeDeltaBase == 0) revert NoRebalanceNeeded();
 
-        orderId = hedgeAdapter.commitHedge(hedgeDeltaBase, acceptablePrice);
+        orderId = hedgeAdapter.commitHedge(PoolId.unwrap(poolId), hedgeDeltaBase, acceptablePrice);
         state.pendingOrderId = orderId;
         state.pendingOrderBase = hedgeDeltaBase;
         state.targetHedgeBase = 0;
         state.lastRebalanceTimestamp = block.timestamp;
+        _refreshSnapshot(poolId, state);
+        if (state.pendingOrderId == bytes32(0)) {
+            state.pendingOrderId = orderId;
+            state.pendingOrderBase = hedgeDeltaBase;
+        }
         state.healthMode = HealthMode.Defensive;
 
         emit EmergencyDeRiskRequested(PoolId.unwrap(poolId), orderId, hedgeDeltaBase);
@@ -402,6 +444,14 @@ contract ProductionDeltaNeutralHook is IHooks {
 
     function getRiskState(PoolKey calldata key) external view returns (StrategyRiskState memory) {
         return riskStates[key.toId()];
+    }
+
+    function getPoolConfig(PoolKey calldata key) external view returns (PoolConfig memory) {
+        return poolConfigs[key.toId()];
+    }
+
+    function strategyId(PoolKey calldata key) external pure returns (bytes32) {
+        return PoolId.unwrap(key.toId());
     }
 
     function netBaseDelta(PoolKey calldata key) external view returns (int256) {
@@ -436,13 +486,14 @@ contract ProductionDeltaNeutralHook is IHooks {
     }
 
     function afterAddLiquidity(
-        address,
-        PoolKey calldata,
+        address sender,
+        PoolKey calldata key,
         ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
         bytes calldata
-    ) external view onlyPoolManager returns (bytes4, BalanceDelta) {
+    ) external onlyPoolManager returns (bytes4, BalanceDelta) {
+        _accountLiquidityDelta(sender, key, delta, feesAccrued, true);
         return (IHooks.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
@@ -457,13 +508,14 @@ contract ProductionDeltaNeutralHook is IHooks {
     }
 
     function afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
+        address sender,
+        PoolKey calldata key,
         ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
         bytes calldata
-    ) external view onlyPoolManager returns (bytes4, BalanceDelta) {
+    ) external onlyPoolManager returns (bytes4, BalanceDelta) {
+        _accountLiquidityDelta(sender, key, delta, feesAccrued, false);
         return (IHooks.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
@@ -475,6 +527,7 @@ contract ProductionDeltaNeutralHook is IHooks {
         PoolId poolId = key.toId();
         PoolConfig storage config = _requireConfigured(poolId);
         StrategyRiskState storage state = riskStates[poolId];
+        _applyHealth(config, state);
         uint24 feePips = _computeFee(config, state, params.zeroForOne);
         bool exposureIncreasing =
             _increasesExposure(state.netBaseDelta, _poolBaseExposureDirection(config, params.zeroForOne));
@@ -493,16 +546,8 @@ contract ProductionDeltaNeutralHook is IHooks {
 
         int128 baseCallerDelta = config.baseIsCurrency0 ? delta.amount0() : delta.amount1();
         state.poolBaseExposure -= int256(baseCallerDelta);
-        _syncDelta(config, state);
-
-        int256 hedgeDeltaBase = _requiredHedgeDelta(config, state);
-        if (hedgeDeltaBase != 0 && state.pendingOrderBase == 0) {
-            state.targetHedgeBase = state.hedgePositionBase + hedgeDeltaBase;
-            state.healthMode = HealthMode.NeedsRebalance;
-            emit RebalanceNeeded(
-                PoolId.unwrap(poolId), state.netBaseDelta, state.targetHedgeBase, hedgeDeltaBase, state.healthMode
-            );
-        }
+        _syncDelta(state);
+        _requestRebalanceIfNeeded(poolId, config, state);
         _emitRiskState(poolId, state);
 
         return (IHooks.afterSwap.selector, 0);
@@ -553,38 +598,38 @@ contract ProductionDeltaNeutralHook is IHooks {
     }
 
     function _refreshSnapshot(PoolId poolId, StrategyRiskState storage state) internal {
-        IHedgeAdapter.HedgeSnapshot memory snapshot = hedgeAdapter.getSnapshot();
+        IHedgeAdapter.HedgeSnapshot memory snapshot = hedgeAdapter.getSnapshot(PoolId.unwrap(poolId));
         _applySnapshot(state, snapshot);
-        if (snapshot.pendingOrder && state.pendingOrderId == bytes32(0)) {
-            state.pendingOrderId = keccak256(abi.encode(PoolId.unwrap(poolId), snapshot.pendingOrderBase));
-        }
     }
 
     function _applySnapshot(StrategyRiskState storage state, IHedgeAdapter.HedgeSnapshot memory snapshot) internal {
         state.hedgePositionBase = snapshot.positionBase;
         state.pendingOrderBase = snapshot.pendingOrderBase;
+        state.pendingOrderId = snapshot.pendingOrderId;
         state.realizedPnlUsd = snapshot.realizedPnlUsd;
         state.unrealizedPnlUsd = snapshot.unrealizedPnlUsd;
         state.collateralUsd = snapshot.collateralUsd;
         if (state.initialCollateralUsd == 0 && snapshot.collateralUsd != 0) {
             state.initialCollateralUsd = snapshot.collateralUsd;
         }
-        state.lastHedgePrice = snapshot.lastPrice;
+        state.lastMarkPrice = snapshot.markPrice;
+        state.lastSnapshotTimestamp = snapshot.updatedAt;
+        state.pendingOrderReadyAt = snapshot.settlementReadyAt;
+        state.adapterHealthy = snapshot.healthy;
         _syncDeltaFromState(state);
     }
 
     function _applyHealth(PoolConfig storage config, StrategyRiskState storage state) internal {
         if (state.healthMode == HealthMode.Paused) return;
-        if (_isPendingOrderStale(config, state)) {
+        if (
+            !state.adapterHealthy || _isSnapshotStale(config, state) || _isPendingOrderStale(config, state)
+                || _isCollateralBelowRequirement(config, state) || _isMaxLossExceeded(config, state)
+        ) {
             state.healthMode = HealthMode.Defensive;
             return;
         }
         if (state.pendingOrderBase != 0 || state.pendingOrderId != bytes32(0)) {
             state.healthMode = HealthMode.PendingOrder;
-            return;
-        }
-        if (_isMaxLossExceeded(config, state)) {
-            state.healthMode = HealthMode.Defensive;
             return;
         }
         if (_abs(state.netBaseDelta) > config.maxResidualDeltaBase) {
@@ -594,13 +639,27 @@ contract ProductionDeltaNeutralHook is IHooks {
         }
     }
 
+    function _requestRebalanceIfNeeded(PoolId poolId, PoolConfig storage config, StrategyRiskState storage state)
+        internal
+    {
+        int256 hedgeDeltaBase = _requiredHedgeDelta(config, state);
+        if (hedgeDeltaBase != 0 && state.pendingOrderBase == 0 && state.pendingOrderId == bytes32(0)) {
+            state.targetHedgeBase = state.hedgePositionBase + hedgeDeltaBase;
+            state.healthMode = HealthMode.NeedsRebalance;
+            emit RebalanceNeeded(
+                PoolId.unwrap(poolId), state.netBaseDelta, state.targetHedgeBase, hedgeDeltaBase, state.healthMode
+            );
+        }
+        _applyHealth(config, state);
+    }
+
     function _requiredHedgeDelta(PoolConfig storage config, StrategyRiskState storage state) internal returns (int256) {
         _syncDeltaFromState(state);
         if (_abs(state.netBaseDelta) < config.hedgeThresholdBase) return 0;
         return -state.netBaseDelta;
     }
 
-    function _syncDelta(PoolConfig storage, StrategyRiskState storage state) internal {
+    function _syncDelta(StrategyRiskState storage state) internal {
         _syncDeltaFromState(state);
     }
 
@@ -613,12 +672,36 @@ contract ProductionDeltaNeutralHook is IHooks {
         StrategyRiskState storage state,
         int256 hedgeDeltaBase
     ) internal view {
-        uint256 projectedExposure = _abs(state.hedgePositionBase + hedgeDeltaBase);
-        uint256 ratioRequiredUsd = (projectedExposure * config.minCollateralRatioBps) / 10_000;
-        uint256 leverageRequiredUsd = (projectedExposure * 10_000) / config.maxLeverageBps;
-        uint256 requiredUsd = ratioRequiredUsd > leverageRequiredUsd ? ratioRequiredUsd : leverageRequiredUsd;
+        if (!state.adapterHealthy || _isSnapshotStale(config, state)) {
+            revert HedgeAdapterUnhealthy();
+        }
+        uint256 requiredUsd = _requiredCollateralUsd(config, state, hedgeDeltaBase);
         if (state.collateralUsd < requiredUsd) revert InsufficientCollateral(state.collateralUsd, requiredUsd);
         _checkMaxLoss(config, state);
+    }
+
+    function _requiredCollateralUsd(PoolConfig storage config, StrategyRiskState storage state, int256 hedgeDeltaBase)
+        internal
+        view
+        returns (uint256 requiredUsd)
+    {
+        uint256 projectedExposure = _abs(state.hedgePositionBase + hedgeDeltaBase);
+        if (projectedExposure != 0 && state.lastMarkPrice == 0) revert HedgeAdapterUnhealthy();
+        uint256 notionalUsd = (projectedExposure * state.lastMarkPrice) / PRICE_SCALE;
+        uint256 ratioRequiredUsd = (notionalUsd * config.minCollateralRatioBps) / 10_000;
+        uint256 leverageRequiredUsd = (notionalUsd * 10_000) / config.maxLeverageBps;
+        requiredUsd = config.minCollateralUsd;
+        if (ratioRequiredUsd > requiredUsd) requiredUsd = ratioRequiredUsd;
+        if (leverageRequiredUsd > requiredUsd) requiredUsd = leverageRequiredUsd;
+    }
+
+    function _isCollateralBelowRequirement(PoolConfig storage config, StrategyRiskState storage state)
+        internal
+        view
+        returns (bool)
+    {
+        uint256 requiredUsd = _requiredCollateralUsd(config, state, 0);
+        return state.collateralUsd < requiredUsd;
     }
 
     function _checkMaxLoss(PoolConfig storage config, StrategyRiskState storage state) internal view {
@@ -647,6 +730,62 @@ contract ProductionDeltaNeutralHook is IHooks {
     {
         return state.pendingOrderBase != 0 && config.maxPendingOrderAge != 0
             && block.timestamp > state.lastRebalanceTimestamp + config.maxPendingOrderAge;
+    }
+
+    function _isSnapshotStale(PoolConfig storage config, StrategyRiskState storage state) internal view returns (bool) {
+        return config.maxSnapshotAge != 0
+            && (state.lastSnapshotTimestamp == 0
+                || block.timestamp > state.lastSnapshotTimestamp + config.maxSnapshotAge);
+    }
+
+    function _accountLiquidityDelta(
+        address sender,
+        PoolKey calldata key,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bool adding
+    ) internal {
+        if (!_isLiquidityManager(sender)) revert NotLiquidityManager();
+        PoolId poolId = key.toId();
+        PoolConfig storage config = _requireConfigured(poolId);
+        StrategyRiskState storage state = riskStates[poolId];
+        int256 feeBaseDelta = _baseAmount(config, feesAccrued);
+        int256 principalBaseDelta = _baseAmount(config, delta) - feeBaseDelta;
+
+        _applyPrincipalLiquidityDelta(state, principalBaseDelta, adding);
+        _applyFeeLiquidityDelta(state, feeBaseDelta);
+
+        _syncDelta(state);
+        _requestRebalanceIfNeeded(poolId, config, state);
+        emit LiquidityInventoryUpdated(
+            PoolId.unwrap(poolId), adding, principalBaseDelta, feeBaseDelta, state.poolBaseExposure
+        );
+        _emitRiskState(poolId, state);
+    }
+
+    function _baseAmount(PoolConfig storage config, BalanceDelta delta) internal view returns (int256) {
+        return int256(config.baseIsCurrency0 ? delta.amount0() : delta.amount1());
+    }
+
+    function _applyPrincipalLiquidityDelta(StrategyRiskState storage state, int256 principalBaseDelta, bool adding)
+        internal
+    {
+        if (adding && principalBaseDelta < 0) {
+            uint256 deposited = _abs(principalBaseDelta);
+            state.lpBaseDeposited += deposited;
+            state.poolBaseExposure += int256(deposited);
+        } else if (!adding && principalBaseDelta > 0) {
+            uint256 withdrawn = _abs(principalBaseDelta);
+            state.lpBaseWithdrawn += withdrawn;
+            state.poolBaseExposure -= int256(withdrawn);
+        }
+    }
+
+    function _applyFeeLiquidityDelta(StrategyRiskState storage state, int256 feeBaseDelta) internal {
+        if (feeBaseDelta <= 0) return;
+        uint256 fees = _abs(feeBaseDelta);
+        state.lpBaseFeesAccrued += fees;
+        state.poolBaseExposure += int256(fees);
     }
 
     function _isLiquidityManager(address sender) internal view returns (bool) {

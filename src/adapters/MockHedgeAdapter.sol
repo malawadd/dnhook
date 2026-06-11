@@ -5,12 +5,12 @@ import {IERC20Minimal} from "../interfaces/IERC20Minimal.sol";
 import {IHedgeAdapter} from "../interfaces/IHedgeAdapter.sol";
 
 contract MockHedgeAdapter is IHedgeAdapter {
-    HedgeSnapshot public snapshot;
+    mapping(bytes32 strategyId => HedgeSnapshot snapshot) internal snapshots;
     address public hook;
     bytes32 public latestOrderId;
-    int256 public nextFillBase;
-    int256 public nextRealizedPnlUsd;
-    uint256 public nextLastPrice;
+    mapping(bytes32 strategyId => int256 nextFillBase) public nextFillBase;
+    mapping(bytes32 strategyId => int256 nextRealizedPnlUsd) public nextRealizedPnlUsd;
+    mapping(bytes32 strategyId => uint256 nextMarkPrice) public nextMarkPrice;
 
     error NotHook();
 
@@ -23,70 +23,93 @@ contract MockHedgeAdapter is IHedgeAdapter {
         hook = _hook;
     }
 
-    function setSnapshot(HedgeSnapshot calldata nextSnapshot) external {
-        snapshot = nextSnapshot;
+    function setSnapshot(bytes32 strategyId, HedgeSnapshot calldata nextSnapshot) external {
+        snapshots[strategyId] = nextSnapshot;
+        snapshots[strategyId].strategyId = strategyId;
     }
 
-    function setNextSettlement(int256 fillBase, int256 realizedPnlUsd, uint256 lastPrice) external {
-        nextFillBase = fillBase;
-        nextRealizedPnlUsd = realizedPnlUsd;
-        nextLastPrice = lastPrice;
+    function setNextSettlement(bytes32 strategyId, int256 fillBase, int256 realizedPnlUsd, uint256 markPrice) external {
+        nextFillBase[strategyId] = fillBase;
+        nextRealizedPnlUsd[strategyId] = realizedPnlUsd;
+        nextMarkPrice[strategyId] = markPrice;
     }
 
-    function depositCollateral(address token, uint256 amount)
+    function depositCollateral(bytes32 strategyId, address token, uint256 amount)
         external
         override
         onlyHook
         returns (uint256 collateralUsd)
     {
+        HedgeSnapshot storage snapshot = snapshots[strategyId];
         IERC20Minimal(token).transferFrom(msg.sender, address(this), amount);
+        snapshot.strategyId = strategyId;
         snapshot.collateralUsd += amount;
+        if (snapshot.markPrice == 0) snapshot.markPrice = 2_000 ether;
+        if (snapshot.updatedAt == 0) snapshot.updatedAt = block.timestamp;
         snapshot.healthy = true;
-        emit CollateralDeposited(msg.sender, token, amount);
+        emit CollateralDeposited(strategyId, msg.sender, token, amount);
         return snapshot.collateralUsd;
     }
 
-    function withdrawCollateral(address token, address to, uint256 amount)
+    function withdrawCollateral(bytes32 strategyId, address token, address to, uint256 amount)
         external
         override
         onlyHook
         returns (uint256 collateralUsd)
     {
+        HedgeSnapshot storage snapshot = snapshots[strategyId];
         snapshot.collateralUsd = amount > snapshot.collateralUsd ? 0 : snapshot.collateralUsd - amount;
+        snapshot.updatedAt = block.timestamp;
         IERC20Minimal(token).transfer(to, amount);
-        emit CollateralWithdrawn(msg.sender, token, to, amount);
+        emit CollateralWithdrawn(strategyId, msg.sender, token, to, amount);
         return snapshot.collateralUsd;
     }
 
-    function commitHedge(int256 sizeDeltaBase, uint256 acceptablePrice)
+    function commitHedge(bytes32 strategyId, int256 sizeDeltaBase, uint256 acceptablePrice)
         external
         override
         onlyHook
         returns (bytes32 orderId)
     {
-        latestOrderId = keccak256(abi.encode(block.number, sizeDeltaBase, acceptablePrice));
-        snapshot.pendingOrder = true;
+        HedgeSnapshot storage snapshot = snapshots[strategyId];
+        latestOrderId = keccak256(abi.encode(strategyId, block.number, sizeDeltaBase, acceptablePrice));
+        snapshot.strategyId = strategyId;
+        snapshot.pendingOrderId = latestOrderId;
         snapshot.pendingOrderBase = sizeDeltaBase;
-        emit HedgeOrderCommitted(latestOrderId, sizeDeltaBase, acceptablePrice);
+        snapshot.settlementReadyAt = block.timestamp;
+        snapshot.updatedAt = block.timestamp;
+        if (snapshot.markPrice == 0) snapshot.markPrice = acceptablePrice;
+        snapshot.healthy = true;
+        emit HedgeOrderCommitted(strategyId, latestOrderId, sizeDeltaBase, acceptablePrice);
         return latestOrderId;
     }
 
-    function settleHedge(bytes32 orderId) external override onlyHook returns (HedgeSnapshot memory settledSnapshot) {
-        int256 fillBase = nextFillBase == 0 ? snapshot.pendingOrderBase : nextFillBase;
+    function settleHedge(bytes32 strategyId, bytes32 orderId)
+        external
+        override
+        onlyHook
+        returns (HedgeSnapshot memory settledSnapshot)
+    {
+        HedgeSnapshot storage snapshot = snapshots[strategyId];
+        require(snapshot.pendingOrderId == orderId, "MockHedgeAdapter: wrong order");
+        int256 fillBase = nextFillBase[strategyId] == 0 ? snapshot.pendingOrderBase : nextFillBase[strategyId];
         snapshot.positionBase += fillBase;
         snapshot.pendingOrderBase = 0;
-        snapshot.pendingOrder = false;
-        snapshot.realizedPnlUsd += nextRealizedPnlUsd;
-        if (nextLastPrice != 0) snapshot.lastPrice = nextLastPrice;
-        emit HedgeOrderSettled(orderId, fillBase, nextRealizedPnlUsd);
+        snapshot.pendingOrderId = bytes32(0);
+        snapshot.realizedPnlUsd += nextRealizedPnlUsd[strategyId];
+        if (nextMarkPrice[strategyId] != 0) snapshot.markPrice = nextMarkPrice[strategyId];
+        snapshot.updatedAt = block.timestamp;
+        snapshot.settlementReadyAt = 0;
+        snapshot.healthy = true;
+        emit HedgeOrderSettled(strategyId, orderId, fillBase, nextRealizedPnlUsd[strategyId]);
 
-        nextFillBase = 0;
-        nextRealizedPnlUsd = 0;
-        nextLastPrice = 0;
+        nextFillBase[strategyId] = 0;
+        nextRealizedPnlUsd[strategyId] = 0;
+        nextMarkPrice[strategyId] = 0;
         return snapshot;
     }
 
-    function getSnapshot() external view override returns (HedgeSnapshot memory) {
-        return snapshot;
+    function getSnapshot(bytes32 strategyId) external view override returns (HedgeSnapshot memory) {
+        return snapshots[strategyId];
     }
 }

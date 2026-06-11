@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config as loadDotenv } from 'dotenv';
 import type { Hex } from 'viem';
+import type { HookMode } from './deployment.js';
 
 const keeperDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(keeperDir, '../..');
@@ -15,28 +16,41 @@ for (const path of [resolve(projectRoot, '.env'), resolve(keeperRoot, '.env')]) 
 }
 
 export type KeeperConfig = {
+  mode: HookMode;
   rpcUrl: string;
   privateKey: Hex;
   pollIntervalMs: number;
   dryRun: boolean;
+  maxHedgeSlippageBps: bigint;
 };
 
 export function loadKeeperConfig(): KeeperConfig {
+  const mode = parseHookMode(process.env.HOOK_MODE);
   const keeperPrivateKey = process.env.KEEPER_PRIVATE_KEY?.trim();
   const privateKey = keeperPrivateKey ? keeperPrivateKey : process.env.PRIVATE_KEY;
-  if (!process.env.SEPOLIA_RPC_URL) {
-    throw new Error('Missing SEPOLIA_RPC_URL in environment.');
+  const rpcUrl = mode === 'production' ? process.env.BASE_SEPOLIA_RPC_URL : process.env.SEPOLIA_RPC_URL;
+  if (!rpcUrl) {
+    throw new Error(`Missing ${mode === 'production' ? 'BASE_SEPOLIA_RPC_URL' : 'SEPOLIA_RPC_URL'} in environment.`);
   }
   if (!privateKey) {
     throw new Error('Missing KEEPER_PRIVATE_KEY or PRIVATE_KEY in environment.');
   }
 
   return {
-    rpcUrl: process.env.SEPOLIA_RPC_URL,
+    mode,
+    rpcUrl,
     privateKey: normalizePrivateKey(privateKey),
     pollIntervalMs: parsePositiveInteger(process.env.POLL_INTERVAL_MS, 12_000),
     dryRun: parseBoolean(process.env.DRY_RUN),
+    maxHedgeSlippageBps: BigInt(parsePositiveInteger(process.env.MAX_HEDGE_SLIPPAGE_BPS, 100)),
   };
+}
+
+function parseHookMode(value: string | undefined): HookMode {
+  if (!value) return 'capstone';
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'capstone' || normalized === 'production') return normalized;
+  throw new Error('HOOK_MODE must be capstone or production.');
 }
 
 function normalizePrivateKey(value: string): Hex {
