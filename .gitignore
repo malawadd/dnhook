@@ -11,6 +11,13 @@ frontend/*.tsbuildinfo
 frontend/node_modules/
 keeper/node_modules/
 keeper/coverage/
+live-demo/.demo-state/
+live-demo/.env
+live-demo/.env.*
+!live-demo/.env.example
+live-demo/dist/
+live-demo/node_modules/
 report*.md
 *report*.md
 PROJECT_STORY.md
+PROJECT_VISUALS.md
