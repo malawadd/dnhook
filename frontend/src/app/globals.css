@@ -171,6 +171,33 @@ small {
   border-color: rgba(47, 111, 237, 0.45);
 }
 
+.modebar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.mode-button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.mode-button.active {
+  color: var(--text);
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
 .token-row {
   display: flex;
   align-items: center;
@@ -273,4 +300,3 @@ small {
     grid-template-columns: 1fr;
   }
 }
-

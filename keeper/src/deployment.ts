@@ -14,6 +14,9 @@ export type Deployment = {
   chainId: number;
   network: string;
   hook: Address;
+  hedgeAdapter?: Address;
+  poolSwapTest?: Address;
+  liquidityRouter?: Address;
   currency0: Address;
   currency1: Address;
   fee: number;
@@ -21,6 +24,7 @@ export type Deployment = {
   hooks: Address;
   baseToken: Address;
   quoteToken: Address;
+  baseIsCurrency0: boolean;
   poolId: `0x${string}`;
 };
 

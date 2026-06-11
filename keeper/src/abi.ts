@@ -8,6 +8,19 @@ const poolKeyComponents = [
   { name: 'hooks', type: 'address' },
 ] as const;
 
+const swapParamsComponents = [
+  { name: 'zeroForOne', type: 'bool' },
+  { name: 'amountSpecified', type: 'int256' },
+  { name: 'sqrtPriceLimitX96', type: 'uint160' },
+] as const;
+
+const liquidityParamsComponents = [
+  { name: 'tickLower', type: 'int24' },
+  { name: 'tickUpper', type: 'int24' },
+  { name: 'liquidityDelta', type: 'int256' },
+  { name: 'salt', type: 'bytes32' },
+] as const;
+
 export const capstoneHookAbi = [
   {
     type: 'function',
@@ -148,6 +161,115 @@ export const productionHookAbi = [
     name: 'settleHedgeOrder',
     stateMutability: 'nonpayable',
     inputs: [{ name: 'key', type: 'tuple', components: poolKeyComponents }],
+    outputs: [],
+  },
+] as const satisfies Abi;
+
+export const demoErc20Abi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: 'balance', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: 'allowance', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'faucet',
+    stateMutability: 'nonpayable',
+    inputs: [],
+    outputs: [],
+  },
+] as const satisfies Abi;
+
+export const poolSwapTestAbi = [
+  {
+    type: 'function',
+    name: 'swap',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'key', type: 'tuple', components: poolKeyComponents },
+      { name: 'params', type: 'tuple', components: swapParamsComponents },
+      {
+        name: 'testSettings',
+        type: 'tuple',
+        components: [
+          { name: 'takeClaims', type: 'bool' },
+          { name: 'settleUsingBurn', type: 'bool' },
+        ],
+      },
+      { name: 'hookData', type: 'bytes' },
+    ],
+    outputs: [{ name: 'delta', type: 'int256' }],
+  },
+] as const satisfies Abi;
+
+export const productionLiquidityRouterAbi = [
+  {
+    type: 'function',
+    name: 'modifyLiquidity',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'key', type: 'tuple', components: poolKeyComponents },
+      { name: 'params', type: 'tuple', components: liquidityParamsComponents },
+      { name: 'hookData', type: 'bytes' },
+    ],
+    outputs: [{ name: 'delta', type: 'int256' }],
+  },
+] as const satisfies Abi;
+
+export const demoHedgeAdapterAbi = [
+  {
+    type: 'function',
+    name: 'setHealthy',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'strategyId', type: 'bytes32' },
+      { name: 'healthy', type: 'bool' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'setNextSettlement',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'strategyId', type: 'bytes32' },
+      { name: 'fillBase', type: 'int256' },
+      { name: 'realizedPnlUsd', type: 'int256' },
+      { name: 'markPrice', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'resetDemoSnapshot',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'strategyId', type: 'bytes32' },
+      { name: 'markPrice', type: 'uint256' },
+      { name: 'collateralUsd', type: 'uint256' },
+    ],
     outputs: [],
   },
 ] as const satisfies Abi;

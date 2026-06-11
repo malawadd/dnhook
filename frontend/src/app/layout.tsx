@@ -4,7 +4,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Delta Neutral Hook',
-  description: 'Sepolia operator UI for the Uniswap v4 delta-neutral hook demo',
+  description: 'Dual-network operator UI for Uniswap v4 delta-neutral hook demos',
 };
 
 export default function RootLayout({
@@ -20,4 +20,3 @@ export default function RootLayout({
     </html>
   );
 }
-

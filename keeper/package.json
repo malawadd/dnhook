@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "once": "tsx src/index.ts --once",
+    "demo:production:happy": "tsx src/demo.ts happy",
+    "demo:production:defensive": "tsx src/demo.ts defensive",
+    "demo:production:full": "tsx src/demo.ts full",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
