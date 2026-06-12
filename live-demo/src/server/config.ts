@@ -9,6 +9,7 @@ const serverDir = dirname(fileURLToPath(import.meta.url));
 export const liveDemoRoot = resolve(serverDir, '../..');
 export const projectRoot = resolve(liveDemoRoot, '..');
 const defaultDeploymentPath = resolve(projectRoot, 'deployments/base-sepolia-production.json');
+const defaultForkRpcUrl = 'http://127.0.0.1:8545';
 
 for (const path of [resolve(projectRoot, '.env'), resolve(liveDemoRoot, '.env')]) {
   if (existsSync(path)) loadDotenv({ path, override: path.startsWith(liveDemoRoot) });
@@ -43,10 +44,12 @@ export type PoolKey = {
 };
 
 export type LiveDemoConfig = {
+  mode: 'base-sepolia' | 'fork';
   apiPort: number;
   rpcUrl: string;
   rpcUrls: string[];
   writeRpcUrl: string;
+  writeRpcUrls: string[];
   privateKey: Hex;
   traderCount: number;
   traderFundingWei: bigint;
@@ -60,29 +63,59 @@ export type LiveDemoConfig = {
   maxHedgeSlippageBps: bigint;
   deploymentPath: string;
   stateDir: string;
+  traderStateFile: string;
   minTxIntervalMs: number;
   getLogsBlockSpan: number;
   priceBackfillBlocks: number;
   replacementFeeBumpBps: bigint;
   nonceConfirmTimeoutMs: number;
   allowWalletRotation: boolean;
+  rpcCooldownMs: number;
+  rpcRetryAttempts: number;
+  traderBalanceRefreshMs: number;
+  forkRpcUrl: string;
+  forkBackoffMs: number;
+  forkMaxConsecutiveErrors: number;
+  showcaseExposureTargetBase: bigint;
+  showcaseNetDeltaTargetBase: bigint;
+  showcaseMarkPriceStart: bigint;
+  showcaseMarkPriceStep: bigint;
+  showcaseRealizedLossUsd: bigint;
+  showcaseUnrealizedLossUsd: bigint;
+  showcaseLowCollateralUsd: bigint;
+  showcasePhaseDelayMs: number;
 };
 
 export function loadLiveConfig(): LiveDemoConfig {
-  const traderFundingEth = process.env.LIVE_TRADER_FUNDING_ETH?.trim() || '0.05';
-  const maxTxPerMinute = parsePositiveInt(process.env.LIVE_MAX_TX_PER_MIN, 30);
-  const rpcUrls = parseRpcUrls();
+  const mode = parseMode(process.env.LIVE_MODE);
+  const forkRpcUrl = process.env.LIVE_FORK_RPC_URL?.trim() || defaultForkRpcUrl;
+  const traderFundingEth =
+    mode === 'fork'
+      ? process.env.LIVE_FORK_TRADER_FUNDING_ETH?.trim() || '0.02'
+      : process.env.LIVE_TRADER_FUNDING_ETH?.trim() || '0.05';
+  const maxTxPerMinute = parsePositiveInt(process.env.LIVE_MAX_TX_PER_MIN, mode === 'fork' ? 90 : 30);
+  const rpcUrls = mode === 'fork' ? [forkRpcUrl] : parseRpcUrls();
+  const writeRpcUrl =
+    mode === 'fork'
+      ? forkRpcUrl
+      : process.env.BASE_SEPOLIA_WRITE_RPC_URL?.trim() || process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0];
+  const writeRpcUrls = mode === 'fork' ? [forkRpcUrl] : parseWriteRpcUrls(writeRpcUrl);
+  const traderCount = mode === 'fork'
+    ? clampTraderCount(parsePositiveInt(process.env.LIVE_FORK_TRADER_COUNT ?? process.env.LIVE_TRADER_COUNT, 5))
+    : clampTraderCount(parsePositiveInt(process.env.LIVE_TRADER_COUNT, 10));
   return {
+    mode,
     apiPort: parsePositiveInt(process.env.LIVE_DEMO_API_PORT, 8787),
-    rpcUrl: process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0],
+    rpcUrl: mode === 'fork' ? forkRpcUrl : process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0],
     rpcUrls,
-    writeRpcUrl: process.env.BASE_SEPOLIA_WRITE_RPC_URL?.trim() || process.env.BASE_SEPOLIA_RPC_URL?.trim() || rpcUrls[0],
+    writeRpcUrl,
+    writeRpcUrls,
     privateKey: normalizePrivateKey(required(process.env.PRIVATE_KEY, 'PRIVATE_KEY')),
-    traderCount: clampTraderCount(parsePositiveInt(process.env.LIVE_TRADER_COUNT, 10)),
+    traderCount,
     traderFundingWei: parseFundingTarget(traderFundingEth),
     traderFundingEth,
-    swapIntervalMs: parsePositiveInt(process.env.LIVE_SWAP_INTERVAL_MS, 4000),
-    keeperIntervalMs: parsePositiveInt(process.env.LIVE_KEEPER_INTERVAL_MS, 8000),
+    swapIntervalMs: parsePositiveInt(process.env.LIVE_SWAP_INTERVAL_MS, mode === 'fork' ? 1500 : 4000),
+    keeperIntervalMs: parsePositiveInt(process.env.LIVE_KEEPER_INTERVAL_MS, mode === 'fork' ? 3000 : 8000),
     maxTxPerMinute,
     maxRuntimeMinutes: parsePositiveInt(process.env.LIVE_MAX_RUNTIME_MINUTES, 20),
     minSwapAmount: parseUnits(process.env.LIVE_SWAP_MIN_BASE || '0.02', 18),
@@ -90,12 +123,27 @@ export function loadLiveConfig(): LiveDemoConfig {
     maxHedgeSlippageBps: BigInt(parsePositiveInt(process.env.MAX_HEDGE_SLIPPAGE_BPS, 100)),
     deploymentPath: process.env.LIVE_DEPLOYMENT_PATH || defaultDeploymentPath,
     stateDir: resolve(liveDemoRoot, '.demo-state'),
+    traderStateFile: mode === 'fork' ? 'fork-traders.json' : 'traders.json',
     minTxIntervalMs: txIntervalFromRateLimit(maxTxPerMinute),
     getLogsBlockSpan: parsePositiveInt(process.env.LIVE_GET_LOGS_BLOCK_SPAN, 10),
     priceBackfillBlocks: parsePositiveInt(process.env.LIVE_PRICE_BACKFILL_BLOCKS, 40),
     replacementFeeBumpBps: BigInt(parsePositiveInt(process.env.LIVE_REPLACEMENT_FEE_BUMP_BPS, 2500)),
     nonceConfirmTimeoutMs: parsePositiveInt(process.env.LIVE_NONCE_CONFIRM_TIMEOUT_MS, 120_000),
     allowWalletRotation: parseBoolean(process.env.LIVE_ALLOW_WALLET_ROTATION),
+    rpcCooldownMs: parsePositiveInt(process.env.LIVE_RPC_COOLDOWN_MS, 30_000),
+    rpcRetryAttempts: parsePositiveInt(process.env.LIVE_RPC_RETRY_ATTEMPTS, 2),
+    traderBalanceRefreshMs: parsePositiveInt(process.env.LIVE_TRADER_BALANCE_REFRESH_MS, 15_000),
+    forkRpcUrl,
+    forkBackoffMs: parsePositiveInt(process.env.LIVE_FORK_BACKOFF_MS, 3_000),
+    forkMaxConsecutiveErrors: parsePositiveInt(process.env.LIVE_FORK_MAX_CONSECUTIVE_ERRORS, 5),
+    showcaseExposureTargetBase: parseUnits(process.env.LIVE_SHOWCASE_EXPOSURE_TARGET_BASE || '1', 18),
+    showcaseNetDeltaTargetBase: parseUnits(process.env.LIVE_SHOWCASE_NET_DELTA_TARGET_BASE || '0.1', 18),
+    showcaseMarkPriceStart: parseUnits(process.env.LIVE_SHOWCASE_MARK_PRICE_START || '2000', 18),
+    showcaseMarkPriceStep: parseUnits(process.env.LIVE_SHOWCASE_MARK_PRICE_STEP || '100', 18),
+    showcaseRealizedLossUsd: parseUnits(process.env.LIVE_SHOWCASE_REALIZED_LOSS_USD || '5000', 18),
+    showcaseUnrealizedLossUsd: parseUnits(process.env.LIVE_SHOWCASE_UNREALIZED_LOSS_USD || '2500', 18),
+    showcaseLowCollateralUsd: parseUnits(process.env.LIVE_SHOWCASE_LOW_COLLATERAL_USD || '500', 18),
+    showcasePhaseDelayMs: parsePositiveInt(process.env.LIVE_SHOWCASE_PHASE_DELAY_MS, 5_000),
   };
 }
 
@@ -152,6 +200,8 @@ export function configView(config: LiveDemoConfig, deployment: Deployment) {
     keeperIntervalMs: config.keeperIntervalMs,
     maxTxPerMinute: config.maxTxPerMinute,
     maxRuntimeMinutes: config.maxRuntimeMinutes,
+    writeRpcCount: config.writeRpcUrls.length,
+    mode: config.mode,
   };
 }
 
@@ -180,10 +230,31 @@ function parseRpcUrls() {
   return uniqueStrings([...(primary ? [primary] : []), ...configured, ...defaults]);
 }
 
+function parseWriteRpcUrls(primary: string) {
+  const defaults = [
+    'https://sepolia.base.org',
+    'https://base-sepolia-rpc.publicnode.com',
+    'https://base-sepolia.gateway.tenderly.co',
+    'https://base-sepolia.rpc.sentio.xyz',
+    'https://base-sepolia.api.onfinality.io/public',
+    'https://base-sepolia-public.nodies.app',
+  ];
+  const configured = process.env.BASE_SEPOLIA_WRITE_RPC_URLS?.split(',').map((url) => url.trim()).filter(Boolean) ?? [];
+  return uniqueStrings([primary, ...configured, ...defaults].filter(isHttpsUrl));
+}
+
+function isHttpsUrl(value: string) {
+  return value.startsWith('https://');
+}
+
 function uniqueStrings(values: string[]) {
   return [...new Set(values)];
 }
 
 function parseBoolean(value: string | undefined) {
   return value === '1' || value?.toLowerCase() === 'true';
+}
+
+function parseMode(value: string | undefined): LiveDemoConfig['mode'] {
+  return value === 'fork' ? 'fork' : 'base-sepolia';
 }

@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:fork": "node scripts/dev-fork.mjs",
+    "fork:anvil": "node scripts/fork-anvil.mjs",
     "dev:api": "tsx src/server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",

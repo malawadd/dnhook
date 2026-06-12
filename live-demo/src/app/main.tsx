@@ -84,10 +84,13 @@ function App() {
 
   const totals = useMemo(() => {
     const traders = snapshot?.traders ?? [];
+    const rpcHealth = snapshot?.rpcHealth ?? [];
     return {
       submitted: traders.reduce((sum, trader) => sum + trader.swapsSubmitted, 0),
       confirmed: traders.reduce((sum, trader) => sum + trader.swapsConfirmed, 0),
       failed: traders.reduce((sum, trader) => sum + trader.swapsFailed, 0),
+      coolingRpcs: rpcHealth.filter((rpc) => rpc.coolingDown).length,
+      rpcRetries: rpcHealth.reduce((sum, rpc) => sum + rpc.retries, 0),
     };
   }, [snapshot]);
 
@@ -118,17 +121,21 @@ function App() {
         <button disabled={Boolean(busy)} onClick={() => action('Stop keeper', '/api/demo/stop-keeper')}>Stop keeper</button>
         <button disabled={Boolean(busy) || !armed} onClick={() => action('Defensive mode', '/api/demo/scenario/defensive')}>Trigger defensive</button>
         <button disabled={Boolean(busy) || !armed} onClick={() => action('Recover', '/api/demo/scenario/recover')}>Recover</button>
+        <button className="primary" disabled={Boolean(busy) || !armed || snapshot?.config.mode !== 'fork'} onClick={() => action('Start fork showcase', '/api/demo/fork-showcase/start')}>Start Fork Showcase</button>
+        <button disabled={Boolean(busy)} onClick={() => action('Stop showcase', '/api/demo/fork-showcase/stop')}>Stop Showcase</button>
         <button className="stop" disabled={Boolean(busy)} onClick={() => action('Stop all', '/api/demo/stop-all')}>Stop all</button>
       </section>
 
       {busy ? <p className="busy">{busy} is running...</p> : null}
 
       <section className="metrics">
-        <Metric label="Pool price" value={snapshot?.poolPriceUsd ? `$${snapshot.poolPriceUsd.toFixed(2)}` : `$${snapshot?.lastMarkPriceUsd ?? '0'}`} detail={snapshot?.tick ? `tick ${snapshot.tick}` : 'adapter mark fallback'} />
+        <Metric label="Pool tick price" value={snapshot?.poolPriceUsd ? `$${snapshot.poolPriceUsd.toFixed(2)}` : 'n/a'} detail={snapshot?.tick ? `tick ${snapshot.tick}` : 'waiting for swaps'} />
+        <Metric label="Hedge mark price" value={`$${snapshot?.lastMarkPriceUsd ?? '0'}`} detail={`health ${snapshot?.healthMode ?? 0}`} />
         <Metric label="Net delta" value={snapshot?.netBaseDelta ?? '0'} detail={`${snapshot?.poolBaseExposure ?? '0'} pool + ${snapshot?.hedgePositionBase ?? '0'} hedge`} />
         <Metric label="Pending hedge" value={snapshot?.pendingOrderBase ?? '0'} detail={snapshot?.pendingOrderId?.slice(0, 10) ?? 'no order'} />
         <Metric label="Collateral" value={`$${snapshot?.collateralUsd ?? '0'}`} detail={`PnL ${snapshot?.realizedPnlUsd ?? '0'} / ${snapshot?.unrealizedPnlUsd ?? '0'}`} />
         <Metric label="Trader txs" value={`${totals.confirmed}/${totals.submitted}`} detail={`${totals.failed} failed`} />
+        <Metric label="RPC pool" value={`${snapshot?.config.writeRpcCount ?? 0} endpoints`} detail={`${totals.coolingRpcs} cooling / ${totals.rpcRetries} retries`} />
       </section>
 
       <section className="grid">
@@ -160,6 +167,34 @@ function App() {
         </Panel>
       </section>
 
+      {/* <section className="grid lower">
+        <Panel title="Fork Showcase">
+          <div className="showcasePanel">
+            <div>
+              <p className="eyebrow">Status</p>
+              <strong>{snapshot?.forkShowcase.status ?? 'stopped'}</strong>
+              <span>{snapshot?.forkShowcase.phase ?? 'stopped'}</span>
+            </div>
+            <div>
+              <p className="eyebrow">Loop</p>
+              <strong>{snapshot?.forkShowcase.loop ?? 0}</strong>
+              <span>{formatDuration(snapshot?.forkShowcase.elapsedMs ?? 0)}</span>
+            </div>
+            <div className="showcaseAction">
+              <p className="eyebrow">Last action</p>
+              <span>{snapshot?.forkShowcase.lastAction ?? 'Fork showcase is stopped'}</span>
+              {snapshot?.forkShowcase.lastTx ? <code>{snapshot.forkShowcase.lastTx.slice(0, 10)}...{snapshot.forkShowcase.lastTx.slice(-6)}</code> : null}
+              {snapshot?.forkShowcase.error ? <p className="traderError">{snapshot.forkShowcase.error}</p> : null}
+            </div>
+            <div className="checkGrid">
+              {Object.entries(snapshot?.forkShowcase.checks ?? {}).map(([name, passed]) => (
+                <span className={`check ${passed ? 'pass' : ''}`} key={name}>{labelCheck(name)}</span>
+              ))}
+            </div>
+          </div>
+        </Panel>
+      </section> */}
+
       <section className="grid lower">
         <Panel title="Trader Fleet">
           <div className="traderGrid">
@@ -172,13 +207,14 @@ function App() {
                 <code>{trader.address.slice(0, 8)}...{trader.address.slice(-6)}</code>
                 <p>{Number(trader.nativeBalanceEth).toFixed(4)} ETH</p>
                 <p>nonce {trader.latestNonce}/{trader.pendingNonce}</p>
+                <p>{trader.rpcLabel}{trader.rpcCoolingDown ? ' cooling' : ''}</p>
                 <p>{trader.swapsConfirmed}/{trader.swapsSubmitted} swaps</p>
+                {trader.lastRpcError ? <p className="traderError">{trader.lastRpcError}</p> : null}
                 {trader.lastError ? <p className="traderError">{trader.lastError}</p> : null}
               </div>
             ))}
           </div>
         </Panel>
-
         <Panel title="Live Event Tape">
           <div className="eventTape">
             {events.map((event) => (
@@ -190,8 +226,19 @@ function App() {
             ))}
           </div>
         </Panel>
+        <Panel title="RPC Health">
+          <div className="rpcGrid">
+            {(snapshot?.rpcHealth ?? []).map((rpc) => (
+              <div className={`rpcRow ${rpc.coolingDown ? 'cooling' : ''}`} key={rpc.label}>
+                <strong>{rpc.label}</strong>
+                <span>{rpc.coolingDown ? `${Math.ceil(rpc.cooldownMs / 1000)}s cooldown` : 'active'}</span>
+                <span>{rpc.failures} failures</span>
+                <span>{rpc.retries} retries</span>
+              </div>
+            ))}
+          </div>
+        </Panel>
       </section>
-
       <footer>
         <code>{snapshot?.config.hook ?? ''}</code>
         <span>{snapshot?.config.network ?? ''}</span>
@@ -232,6 +279,17 @@ function toPoint(snapshot: LiveSnapshot): ChartPoint {
     pending: Number(snapshot.pendingOrderBase),
     collateral: Number(snapshot.collateralUsd),
   };
+}
+
+function formatDuration(ms: number) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+}
+
+function labelCheck(name: string) {
+  return name.replace(/[A-Z]/g, (match) => ` ${match.toLowerCase()}`);
 }
 
 createRoot(document.getElementById('root')!).render(

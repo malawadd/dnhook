@@ -19,6 +19,11 @@ export const productionHookAbi = parseAbi([
 export const demoHedgeAdapterAbi = parseAbi([
   'function setHealthy(bytes32 strategyId,bool healthy)',
   'function resetDemoSnapshot(bytes32 strategyId,uint256 markPrice,uint256 collateralUsd)',
+  'function setMarkPrice(bytes32 strategyId,uint256 markPrice)',
+  'function setCollateralUsd(bytes32 strategyId,uint256 collateralUsd)',
+  'function setPnl(bytes32 strategyId,int256 realizedPnlUsd,int256 unrealizedPnlUsd)',
+  'function setNextSettlement(bytes32 strategyId,int256 fillBase,int256 realizedPnlUsd,uint256 markPrice)',
+  'function makeSnapshotStale(bytes32 strategyId,uint256 secondsAgo)',
 ]);
 
 export const poolSwapTestAbi = parseAbi([

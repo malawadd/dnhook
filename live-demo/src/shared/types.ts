@@ -1,6 +1,7 @@
 export type HealthLabel = 'Neutral' | 'Flow building exposure' | 'Rebalance needed' | 'Order pending' | 'Hedge settled' | 'Defensive';
 
 export type LiveConfigView = {
+  mode: 'base-sepolia' | 'fork';
   chainId: number;
   network: string;
   hook: string;
@@ -12,6 +13,36 @@ export type LiveConfigView = {
   keeperIntervalMs: number;
   maxTxPerMinute: number;
   maxRuntimeMinutes: number;
+  writeRpcCount: number;
+};
+
+export type ForkShowcaseStatus = {
+  status: 'setup' | 'running' | 'recovering' | 'stopping' | 'stopped' | 'failed';
+  phase: string;
+  loop: number;
+  startedAt: number | null;
+  elapsedMs: number;
+  lastAction: string;
+  lastTx?: string;
+  error?: string;
+  checks: {
+    exposureBuilt: boolean;
+    hedgeSettled: boolean;
+    netDeltaNearNeutral: boolean;
+    pnlApplied: boolean;
+    collateralChanged: boolean;
+    defensiveBlockObserved: boolean;
+    recoveryComplete: boolean;
+  };
+};
+
+export type RpcHealthView = {
+  label: string;
+  active: boolean;
+  coolingDown: boolean;
+  cooldownMs: number;
+  failures: number;
+  retries: number;
 };
 
 export type TraderView = {
@@ -20,6 +51,9 @@ export type TraderView = {
   setupStatus: 'setup' | 'ready' | 'blocked' | 'trading';
   latestNonce: number;
   pendingNonce: number;
+  rpcLabel: string;
+  rpcCoolingDown: boolean;
+  lastRpcError?: string;
   nativeBalanceEth: string;
   token0Balance: string;
   token1Balance: string;
@@ -59,6 +93,8 @@ export type LiveSnapshot = {
   txSubmitted: number;
   txConfirmed: number;
   txFailed: number;
+  rpcHealth: RpcHealthView[];
+  forkShowcase: ForkShowcaseStatus;
   traders: TraderView[];
   config: LiveConfigView;
 };

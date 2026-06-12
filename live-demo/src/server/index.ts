@@ -61,6 +61,18 @@ app.post('/api/demo/scenario/recover', async (request, response) => {
   await armedRoute(request, response, () => orchestrator.recoverScenario());
 });
 
+app.post('/api/demo/fork-showcase/start', async (request, response) => {
+  await armedRoute(request, response, () => orchestrator.startForkShowcase());
+});
+
+app.post('/api/demo/fork-showcase/stop', async (_request, response) => {
+  await route(response, () => orchestrator.stopForkShowcase());
+});
+
+app.get('/api/demo/fork-showcase/status', async (_request, response) => {
+  await route(response, () => orchestrator.forkShowcaseSnapshot());
+});
+
 app.post('/api/demo/stop-all', async (_request, response) => {
   await route(response, () => orchestrator.stopAll());
 });

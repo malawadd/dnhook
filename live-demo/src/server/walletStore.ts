@@ -58,7 +58,7 @@ export function rotateTraders(config: LiveDemoConfig): StoredTrader[] {
 }
 
 function tradersPath(config: LiveDemoConfig) {
-  return resolve(config.stateDir, 'traders.json');
+  return resolve(config.stateDir, config.traderStateFile ?? 'traders.json');
 }
 
 function readTraderFile(path: string): TraderFile {

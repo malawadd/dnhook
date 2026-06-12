@@ -40,6 +40,12 @@ button.stop {
   color: #b00000;
 }
 
+button.primary {
+  background: #14213d;
+  border-color: #14213d;
+  color: #ffffff;
+}
+
 main {
   margin: 0 auto;
   max-width: 1480px;
@@ -133,7 +139,7 @@ h2 {
 .metrics {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin-bottom: 14px;
 }
 
@@ -241,6 +247,76 @@ code {
   gap: 8px;
   max-height: 420px;
   overflow: auto;
+}
+
+.rpcGrid {
+  display: grid;
+  gap: 10px;
+}
+
+.rpcRow {
+  align-items: center;
+  border: 1px solid #dbe3ef;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(70px, 1fr) repeat(3, minmax(80px, auto));
+  min-height: 46px;
+  padding: 10px 12px;
+}
+
+.rpcRow.cooling {
+  background: #fff7e6;
+  border-color: #ffd27a;
+}
+
+.rpcRow span {
+  color: #52677a;
+  font-size: 13px;
+}
+
+.showcasePanel {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 180px)) 1fr;
+}
+
+.showcasePanel strong {
+  display: block;
+  font-size: 28px;
+  line-height: 1.1;
+  margin: 8px 0;
+}
+
+.showcasePanel span {
+  color: #52677a;
+  font-size: 13px;
+}
+
+.showcaseAction {
+  display: grid;
+  gap: 8px;
+}
+
+.checkGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.check {
+  background: #eef2f8;
+  border-radius: 999px;
+  color: #52677a;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 6px 10px;
+}
+
+.check.pass {
+  background: #e6f6ee;
+  color: #006b41;
 }
 
 .event {
